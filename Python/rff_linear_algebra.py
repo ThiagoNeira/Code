@@ -4,18 +4,14 @@ import scipy.linalg as sla
 from scipy.special import gammaln
 from scipy.stats import t
 
-def build_system(psi, Sigma):
+def parameter_freq(psi, y, Sigma):
+
+    y = np.asarray(y).reshape(-1,1)
+    N = psi.shape[0]
 
     K = psi.T @ psi + Sigma
 
     L = np.linalg.cholesky(K)
-    return K, L, psi
-
-def parameter_freq(phi, y, Sigma):
-
-    y = np.asarray(y).reshape(-1,1)
-    N = phi.shape[0]
-    _, L, psi = build_system(phi, Sigma)
 
     rhs = psi.T @ y 
     gamma = sla.cho_solve((L, True), rhs)
@@ -31,13 +27,14 @@ def parameter_freq(phi, y, Sigma):
     
     return gamma, sigma, L
 
-def parameter_bayes(phi, y, mu, Sigma):
+def parameter_bayes(psi, y, mu, Sigma):
 
     y = np.asarray(y).reshape(-1,1)
     mu = np.asarray(mu).reshape(-1,1)
 
-    N = phi.shape[0]
-    _, L, psi = build_system(phi, Sigma)
+    K = psi.T @ psi + Sigma
+
+    L = np.linalg.cholesky(K)
 
     rhs = psi.T @ y + Sigma@mu
     gamma = sla.cho_solve((L, True), rhs)
@@ -48,17 +45,18 @@ def parameter_bayes(phi, y, mu, Sigma):
         
     return gamma, Q, L
 
-
-def score_freq(phi, y, Sigma, criterion='nlpd'):
+def score_freq(psi, y, Sigma, criterion='nlml'):
 
     y = np.asarray(y).reshape(-1,1)
-    N = phi.shape[0]
+    N = psi.shape[0]
 
-    _, L, psi = build_system(phi, Sigma)
+    K = psi.T @ psi + Sigma
+
+    L = np.linalg.cholesky(K)
 
     if criterion == 'nlml':
         rhs = psi.T @ y
-        v_y = sla.solve_triangular(L, rhs, lower=True)
+        v_y = sla.solve_triangular(L, rhs, lower=True, check_finite=False)
         
         Q = float(y.T @ y - v_y.T @ v_y)
         
@@ -66,7 +64,7 @@ def score_freq(phi, y, Sigma, criterion='nlpd'):
         
         return (N / 2.0) * np.log(Q) + 0.5 * log_det_K
 
-    v = sla.solve_triangular(L, psi.T, lower=True)
+    v = sla.solve_triangular(L, psi.T, lower=True, check_finite=False)
     diag_H = np.sum(v ** 2, axis=0).reshape(-1, 1)
     diag_F = 1.0 - diag_H
     
@@ -92,17 +90,19 @@ def score_freq(phi, y, Sigma, criterion='nlpd'):
     else:
         raise ValueError(f"Unknown criterion '{criterion}'. Choose 'nlml' or 'nlpd' or 'mse'.")                                                                   
 
-def score_bayes(phi, y, mu, Sigma, a, b, criterion='nlpd'):
+def score_bayes(psi, y, mu, Sigma, a, b, criterion='nlml'):
 
     y = np.asarray(y).reshape(-1, 1)
     mu = np.asarray(mu).reshape(-1, 1)
-    N = phi.shape[0]
+    N = psi.shape[0]
 
-    _, L, psi = build_system(phi, Sigma)
+    K = psi.T @ psi + Sigma
+
+    L = np.linalg.cholesky(K)
 
     if criterion == 'nlml':
         rhs = psi.T @ y + Sigma @ mu
-        v_y = sla.solve_triangular(L, rhs, lower=True)
+        v_y = sla.solve_triangular(L, rhs, lower=True, check_finite=False)
         
         # Quadratic form Q
         Q = float(y.T @ y + mu.T @ Sigma @ mu - v_y.T @ v_y)
@@ -125,7 +125,7 @@ def score_bayes(phi, y, mu, Sigma, a, b, criterion='nlpd'):
         return float(nlml)
 
     # 2. Efficiently calculate the Hat Matrix diagonal (diag_H)
-    v = sla.solve_triangular(L, psi.T, lower=True)
+    v = sla.solve_triangular(L, psi.T, lower=True, check_finite=False)
     diag_H = np.sum(v ** 2, axis=0).reshape(-1, 1)
     diag_F = 1.0 - diag_H
     

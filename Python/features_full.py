@@ -1,5 +1,6 @@
 # features.py
 import numpy as np
+from scipy.stats import norm, qmc
 
 def sample_frequencies(m, d, kernel='gaussian', eta=1, seed=None):
     """
@@ -21,6 +22,7 @@ def sample_frequencies(m, d, kernel='gaussian', eta=1, seed=None):
         # Precision parameterization: variance is 2*eta
         omega = rng.standard_normal((m, d))
         return np.sqrt(2.0 * eta) * omega
+
 
     elif kernel.lower() == 'matern32':
         nu = 1.5
@@ -55,7 +57,7 @@ def sample_frequencies(m, d, kernel='gaussian', eta=1, seed=None):
     else:
         raise ValueError(f"Unsupported kernel: '{kernel}'. Choose 'gaussian' or 'matern32' or 'matern52'.")
 
-def RFF(X,omega):
+def phi(X,omega):
     X = np.asarray(X)
     if X.ndim == 1:
         X = X.reshape(-1, 1)
@@ -70,26 +72,8 @@ def RFF(X,omega):
     features = np.hstack([cos_part, sin_part])
     return np.sqrt(1/m) * features 
 
-class MF_RFF_Features:
-    def __init__(self, m1, m2, m3, linear=False):
-        self.m1 = m1
-        self.m2 = m2
-        self.m3 = m3
-        self.linear = linear
-    
-    def phi(self, X, omega):
-        return RFF(X, omega)
-    
-    def psi(self, X, omega1, omega2, omega3, beta):
-        phi1 = self.phi(X, omega1)
-        phi2 = RFF(X, omega2)
+def psi(phi1, phi2, phi3, beta):
 
-        z12 = (phi1 @ beta).reshape(-1, 1)
+    z12 = (phi1 @ beta).reshape(-1, 1)
 
-        if self.linear:
-            return np.hstack([phi2, z12])
-        else:
-            phi3 = RFF(X, omega3)
-            diagz12 = np.diag(z12.flatten())
-            r = diagz12 @ phi3
-            return np.hstack([phi2, r])
+    return np.hstack([phi2, z12 * phi3])

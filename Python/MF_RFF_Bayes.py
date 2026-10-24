@@ -3,9 +3,10 @@ from tqdm import tqdm
 from scipy.stats import qmc, multivariate_t, invgamma
 from scipy.optimize import minimize
 from scipy.linalg import solve_triangular, block_diag, cho_solve
-from features_full import MF_RFF_Features, sample_frequencies
+from features_full import sample_frequencies, phi, psi
 from rff_linear_algebra import parameter_bayes, score_bayes
 from joblib import Parallel, delayed
+from threadpoolctl import threadpool_limits
 
 class MF_RFF_bayes:
     """
@@ -20,7 +21,6 @@ class MF_RFF_bayes:
                  kernel = 'gaussian',
                  nugget1 = 1e-6,
                  nugget2 = 1e-6,
-                 tuning_method = 'optim',
                  number_etas_grid = 100,
                  n_restarts = 10,
                  n_samples = 500,
@@ -33,14 +33,15 @@ class MF_RFF_bayes:
         self.kernel = kernel
         self.nugget1 = nugget1
         self.nugget2 = nugget2
-        self.tuning_method = tuning_method
         self.n_starts = n_restarts
         self.samples = n_samples
         self.number_etas_grid = number_etas_grid
-        self.features = None   
         self.criterion = criterion
         self.linear = linear 
         self.seed = seed
+        s1, s2, s3 = [int(c.generate_state(1)[0])
+              for c in np.random.SeedSequence(seed).spawn(3)]
+        self.seed1, self.seed2, self.seed3 = s1, s2, s3
         # Placeholders for data sizes, dimensions, priors, coefficients, and tracking variables
         self.N1 = self.N2 = None
         self.m1 = self.m2 = self.m3 = None
@@ -53,10 +54,13 @@ class MF_RFF_bayes:
         self.omega1 = self.omega2 = self.omega3 = None
         self.eta1 = self.eta2  = self.eta3 = None
         self.beta1 = self.gamma2 = None
+        self.phi1 = self.phi2 = self.phi12 = self.phi32 = None
         self.L1 = self.L2 = None
       
     def _resolve_m(self, N):
         return min(int(0.75*np.sqrt(N) * np.log(N)), int(0.5*N)-1)
+    
+        
     
     def _build_grids(self):
         """Generates a hyperparameter search grid for bandwidths (eta) using Latin Hypercube Sampling."""
@@ -89,30 +93,40 @@ class MF_RFF_bayes:
 
         self.a1 = self.a2 = self.b1 = self.b2 = 1e-6
 
+    def _basis(self, X1, X2):
+        self.phi1 = phi(X1, self.omega1)
+        self.phi12 = phi(X2, self.omega1)
+        self.phi2 = phi(X2, self.omega2)
+        self.phi32 = np.ones((X2.shape[0], 1)) if self.linear else phi(X2, self.omega3)
+
     def _objective_eta1(self, log_eta, X1, z):
         """Generates omega1 dynamically inside optimization for the current eta1."""
         eta1 = 10.0 ** log_eta
-        omega1 = sample_frequencies(self.m1, self.d, kernel=self.kernel, eta=eta1, seed=self.seed)
-        phi1 = self.features.phi(X1, omega1)
+        omega1 = sample_frequencies(self.m1, self.d, kernel=self.kernel, eta=eta1, seed=self.seed1)
+        phi1 = phi(X1, omega1)
         return score_bayes(phi1, z, mu=self.mu1, Sigma=self.Sigma1_inv, a=self.a1, b=self.b1, criterion=self.criterion)
 
     def _objective_eta_high(self, log_eta_high, log_eta1_best, X1, X2, z, y):
         """Generates omega1, omega2, omega3 dynamically inside optimization."""
         eta1 = 10.0 ** log_eta1_best
-        omega1 = sample_frequencies(self.m1, self.d, kernel=self.kernel, eta=eta1, seed=self.seed)
-        phi1 = self.features.phi(X1, omega1)
+        omega1 = sample_frequencies(self.m1, self.d, kernel=self.kernel, eta=eta1, seed=self.seed1)
+        phi1 = phi(X1, omega1)
         beta1, _, _ = parameter_bayes(phi1, z, mu=self.mu1, Sigma=self.Sigma1_inv)
 
+        phi12 = phi(X2, omega1)
         if self.linear:
             eta2 = 10.0 ** log_eta_high[:self.d]
-            omega2 = sample_frequencies(self.m2, self.d, kernel=self.kernel, eta=eta2, seed=self.seed)
-            psi2 = self.features.psi(X2, omega1, omega2, None, beta1)
+            omega2 = sample_frequencies(self.m2, self.d, kernel=self.kernel, eta=eta2, seed=self.seed2)
+            phi2 = phi(X2, omega2)
+            psi2 = psi(phi12, phi2, 1, beta1)
         else:
             eta2 = 10.0 ** log_eta_high[:self.d]
             eta3 = 10.0 ** log_eta_high[self.d:]
-            omega2 = sample_frequencies(self.m2, self.d, kernel=self.kernel, eta=eta2, seed=self.seed)
-            omega3 = sample_frequencies(self.m3, self.d, kernel=self.kernel, eta=eta3, seed=self.seed)
-            psi2 = self.features.psi(X2, omega1, omega2, omega3, beta1)
+            omega2 = sample_frequencies(self.m2, self.d, kernel=self.kernel, eta=eta2, seed=self.seed2)
+            omega3 = sample_frequencies(self.m3, self.d, kernel=self.kernel, eta=eta3, seed=self.seed3)
+            phi2 = phi(X2, omega2)
+            phi3 = phi(X2, omega3)
+            psi2 = psi(phi12, phi2, phi3, beta1)
 
         return score_bayes(psi2, y, mu=self.mu2, Sigma=self.Sigma2_inv, a=self.a2, b=self.b2, criterion=self.criterion)
 
@@ -199,49 +213,10 @@ class MF_RFF_bayes:
             
             return 10.0 ** log_eta1_best, 10.0 ** log_eta23_best[:self.d], 10.0 ** log_eta23_best[self.d:]
 
-    def _tune_bandwidths_grid(self, X1, y1, X2, y2, eta_grid):
-        """Alternative grid-search based bandwidth tuning."""
-        # Step 1: Tune eta1 across the grid
-        phi1_grid = [self.features.phi(X1, sample_frequencies(self.m1, self.d, kernel=self.kernel, eta=eta, seed=self.seed)) for eta in eta_grid]
-        errors = [
-            score_bayes(phi1, y1, mu=self.mu1, Sigma=self.Sigma1_inv, a=self.a1, b=self.b1, criterion=self.criterion)
-            for phi1 in tqdm(phi1_grid, desc="Tuning eta1", unit="eta")
-        ]
-        best_idx = np.argmin(errors)
-        best_eta1 = eta_grid[best_idx]
-        phi1 = phi1_grid[best_idx]
-
-        beta1, _, _ = parameter_bayes(phi1, y1, mu=self.mu1, Sigma=self.Sigma1_inv)
-
-        # Step 2: Tune high-fidelity bandwidths (eta2 & eta3)
-        best_err = np.inf
-        best_eta2, best_eta3 = None, None
-
-        omega1_best = sample_frequencies(self.m1, self.d, kernel=self.kernel, eta=best_eta1, seed=self.seed)
-
-        if self.linear:
-            for eta2 in tqdm(eta_grid, desc="Tuning eta2 (linear)", unit="eta2"):
-                omega2 = sample_frequencies(self.m2, self.d, kernel=self.kernel, eta=eta2, seed=self.seed)
-                psi2 = self.features.psi(X2, omega1_best, omega2, None, beta1)
-                err = score_bayes(psi2, y2, mu=self.mu2, Sigma=self.Sigma2_inv, a=self.a2, b=self.b2, criterion=self.criterion)
-                if err < best_err:
-                    best_err, best_eta2, best_eta3 = err, eta2, eta2
-        else:
-            for eta2 in tqdm(eta_grid, desc="Tuning eta2 & eta3", unit="eta2"):
-                omega2 = sample_frequencies(self.m2, self.d, kernel=self.kernel, eta=eta2, seed=self.seed)
-                for eta3 in eta_grid:
-                    omega3 = sample_frequencies(self.m3, self.d, kernel=self.kernel, eta=eta3, seed=self.seed)
-                    psi2 = self.features.psi(X2, omega1_best, omega2, omega3, beta1)
-                    err = score_bayes(psi2, y2, mu=self.mu2, Sigma=self.Sigma2_inv, a=self.a2, b=self.b2, criterion=self.criterion)
-                    if err < best_err:
-                        best_err, best_eta2, best_eta3 = err, eta2, eta3
-
-        return best_eta1, best_eta2, best_eta3
-    
-    def _level_2_update(self, beta, X2, y2):
+    def _fit_level2(self, beta, X2, y2):
         """Helper method for parallel level-2 posterior updates."""
         beta = beta.reshape(-1, 1)
-        psi2 = self.features.psi(X2, self.omega1, self.omega2, self.omega3, beta)
+        psi2 = psi(self.phi12, self.phi2, self.phi32, beta)
         gamma2_hat, Q2_raw, L2 = parameter_bayes(psi2, y2, mu=self.mu2, Sigma=self.Sigma2_inv)
 
         K2inv = cho_solve((L2, True), np.eye(L2.shape[0]))
@@ -260,10 +235,9 @@ class MF_RFF_bayes:
     
     def parameters_bayes(self, X1, X2, y1, y2):
         """Fits level-1 weights (beta1) and level-2 weights (gamma2) given current bandwidth settings."""
-        phi1 = self.features.phi(X1, self.omega1)
 
         # Solve for level-1 parameters and Cholesky factor L1
-        beta1_hat, Q1_raw, self.L1 =  parameter_bayes(phi1, y1, mu=self.mu1, Sigma=self.Sigma1_inv) 
+        beta1_hat, Q1_raw, self.L1 =  parameter_bayes(self.phi1, y1, mu=self.mu1, Sigma=self.Sigma1_inv) 
         self.Q1 =  Q1_raw + 2*self.b1 
 
         alpha1 = self.N1 + 2*self.a1
@@ -281,9 +255,11 @@ class MF_RFF_bayes:
         self.L2 = []
 
         # PARALLELIZATION: Map level-2 updates across cores instead of running sequentially
-        results = Parallel(n_jobs=-1, backend="threading")(
-            delayed(self._level_2_update)(beta, X2, y2) for beta in self.beta1
-        )
+        
+        with threadpool_limits(limits=1, user_api='blas'):
+            results = Parallel(n_jobs=-1, backend="threading")(
+                delayed(self._fit_level2)(beta, X2, y2) for beta in self.beta1
+            )
         
         self.gamma2, self.Q2, self.sigma2, self.L2 = zip(*results)
         self.gamma2 = list(self.gamma2)
@@ -313,28 +289,21 @@ class MF_RFF_bayes:
         self.p1 = 2*self.m1
         self.p2 = 2*self.m2
         self.p3 = self.m3 if self.linear else 2*self.m3 
-    
-        # Instantiate the feature extractor class
-        self.features = MF_RFF_Features(m1=self.m1, m2=self.m2, m3=self.m3, 
-                                        linear=self.linear)
 
+        print(self.p1)
+        print(self.p2)
+        print(self.p3)
+    
         # Setup prior distributions parameters
         self._priors(tau=1e3)
 
-        if self.tuning_method == 'grid':
-            eta_grid = self._build_grids()
-            self.eta1, self.eta2, self.eta3 = self._tune_bandwidths_grid(X1, z, X2, y, eta_grid)
+        self.eta1, self.eta2, self.eta3 = self._tune_bandwidths_optimization(X1, z, X2, y)
 
-        elif self.tuning_method == 'optim':
-            self.eta1, self.eta2, self.eta3 = self._tune_bandwidths_optimization(
-                X1, z, X2, y)
-                
-        else:
-                raise ValueError(f"Unknown tuning_method '{self.tuning_method}'. Choose 'grid', or 'optim''.")
+        self.omega1 = sample_frequencies(self.m1, self.d, kernel=self.kernel, eta=self.eta1, seed=self.seed1)
+        self.omega2 = sample_frequencies(self.m2, self.d, kernel=self.kernel, eta=self.eta2, seed=self.seed2)
+        self.omega3 = None if self.linear else sample_frequencies(self.m3, self.d, kernel=self.kernel, eta=self.eta3, seed=self.seed3)
 
-        self.omega1 = sample_frequencies(self.m1, self.d, kernel=self.kernel, eta=self.eta1, seed=self.seed)
-        self.omega2 = sample_frequencies(self.m2, self.d, kernel=self.kernel, eta=self.eta2, seed=self.seed)
-        self.omega3 = None if self.linear else sample_frequencies(self.m3, self.d, kernel=self.kernel, eta=self.eta3, seed=self.seed)
+        self._basis(X1, X2)
             
         # Fit parameters across model levels
         self.parameters_bayes(X1, X2, z, y)
@@ -353,10 +322,10 @@ class MF_RFF_bayes:
 
         S = self.beta1.shape[0]
         N_test = X.shape[0]
-        
+
+        phi1_star = phi(X, self.omega1)
         # Low-fidelity prediction path
         if low_fidelity:
-            phi1_star = self.features.phi(X, self.omega1)
             y_pred_samples = phi1_star @ self.beta1.T 
             y_pred = np.mean(y_pred_samples, axis=1).reshape(-1, 1)
 
@@ -390,9 +359,13 @@ class MF_RFF_bayes:
             mu_s_array = np.zeros((N_test, S))
             expvar_array = np.zeros((N_test, S))
 
+            phi2_star = phi(X, self.omega2)
+            phi3_star = np.ones((X.shape[0], 1)) if self.linear else phi(X, self.omega3)
+
             for i, beta1 in enumerate(self.beta1):
+
                 beta1 = beta1.reshape(-1, 1)
-                psi2 = self.features.psi(X, self.omega1, self.omega2, self.omega3, beta1)
+                psi2 = psi(phi1_star, phi2_star, phi3_star, beta1)
                 prediction = psi2 @ self.gamma2[i].reshape(-1, 1)
                 mu_s_array[:, i] = prediction.flatten()
                 v_mat2 = solve_triangular(self.L2[i], psi2.T, lower=True)
