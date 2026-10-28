@@ -7,8 +7,9 @@ from MF_RFF import MF_RFF
 from NARGP import NARGP
 from KO_model import KO
 from One_shot_GP import GP
+import os
 
-from plotting import plot_boxplot, plot_slices_high_1d
+from plotting import plot_boxplot
 
 # ============================================================================
 # Single run
@@ -16,18 +17,23 @@ from plotting import plot_boxplot, plot_slices_high_1d
 def single_run(N1, N2, d, seed, 
                kernel,
                data_dir, 
-               criterion='nlpd', 
-               tuning_method='grid',
+               criterion='nlml', 
                model_names=None):
 
-    # 1. Load Data
-    X1 = np.load(f'{data_dir}/{N1}_{N2}/X1_{N1}_rep{seed}.npy')
-    z  = np.load(f'{data_dir}/{N1}_{N2}/y1_{N1}_rep{seed}.npy').reshape(-1, 1)
-    X2 = np.load(f'{data_dir}/{N1}_{N2}/X2_{N2}_rep{seed}.npy')
-    y  = np.load(f'{data_dir}/{N1}_{N2}/y2_{N2}_rep{seed}.npy').reshape(-1, 1)
 
-    X_test   = np.load(f'{data_dir}/{N1}_{N2}/x_test.npy')
-    y_test   = np.load(f'{data_dir}/{N1}_{N2}/yhigh_test.npy')
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    clean_data_dir = data_dir.replace("Data/", "").replace("Data\\", "")
+
+    base_data_dir = os.path.join(script_dir, 'Data', clean_data_dir, f'{N1}_{N2}')
+
+    # 1. Load Data
+    X1 = np.load(os.path.join(base_data_dir, f'X1_{N1}_rep{seed}.npy'))
+    z  = np.load(os.path.join(base_data_dir, f'y1_{N1}_rep{seed}.npy')).reshape(-1, 1)
+    X2 = np.load(os.path.join(base_data_dir, f'X2_{N2}_rep{seed}.npy'))
+    y  = np.load(os.path.join(base_data_dir, f'y2_{N2}_rep{seed}.npy')).reshape(-1, 1)
+
+    X_test   = np.load(os.path.join(base_data_dir, 'x_test.npy'))
+    y_test   = np.load(os.path.join(base_data_dir, 'yhigh_test.npy'))
 
     # 2. Setup Models via Dictionary Configuration (supporting unique aliases)
     if model_names is None:
@@ -36,8 +42,8 @@ def single_run(N1, N2, d, seed,
             "NARGP": {"n_restarts": 5},
             "MF_RFF_linear": {"n_starts": 5, "number_etas_grid": 100},
             "MF_RFF_nonl": {"n_starts": 5, "number_etas_grid": 100},
-            "MF_RFF_Bayes_l": {"n_starts": 5, "number_etas_grid": 100},
-            "MF_RFF_Bayes_nl": {"n_starts": 5, "number_etas_grid": 100},
+            "MF_RFF_Bayes_l": {"n_starts": 5},
+            "MF_RFF_Bayes_nl": {"n_starts": 5},
             "GP": {"n_restarts": 5},
             "rna": {},
             "cokm": {}
@@ -72,10 +78,9 @@ def single_run(N1, N2, d, seed,
             is_linear = params.get("linear", True if ("l" in model_type.lower() or "linear" in model_type.lower()) and "nl" not in model_type.lower() else False)
             
             rff_kwargs = {
-                'd': d, 'nugget1': 1e-6, 'nugget2': 1e-4, 
-                'number_etas_grid': params.get("number_etas_grid", 100), 
+                'd': d, 'nugget1': 1e-6, 'nugget2': 1e-6, 
                 'criterion': criterion, 'seed': seed,
-                'kernel': kernel, 'tuning_method': tuning_method,
+                'kernel': kernel, 
                 'n_restarts': params.get("n_restarts", 5),
                 'linear': is_linear
             }
@@ -100,13 +105,20 @@ def single_run(N1, N2, d, seed,
         m_type = model_types[name]
         
         if m_type in ["rna", "cokm"]:
-            time_elapsed = float(np.load(f'{data_dir}/{N1}_{N2}/{m_type}_time_rep{seed}.npy'))
+            time_file = os.path.join(base_data_dir, f'{m_type}_time_rep{seed}.npy')
+            time_elapsed = float(np.load(time_file))
             print(f"[TIMER] {name} ({m_type}): {time_elapsed:.3f}s")
             timing[name] = time_elapsed
-            y_pred = np.load(f'{data_dir}/{N1}_{N2}/{m_type}_mean_rep{seed}.npy').reshape(-1,1)
-            y_var = np.load(f'{data_dir}/{N1}_{N2}/{m_type}_sigma2_rep{seed}.npy').reshape(-1,1)
-            y_lower = np.load(f'{data_dir}/{N1}_{N2}/{m_type}_lower_rep{seed}.npy').reshape(-1,1)
-            y_upper = np.load(f'{data_dir}/{N1}_{N2}/{m_type}_upper_rep{seed}.npy').reshape(-1,1)
+
+            y_pred_file  = os.path.join(base_data_dir, f'{m_type}_mean_rep{seed}.npy')
+            y_var_file   = os.path.join(base_data_dir, f'{m_type}_sigma2_rep{seed}.npy')
+            y_lower_file = os.path.join(base_data_dir, f'{m_type}_lower_rep{seed}.npy')
+            y_upper_file = os.path.join(base_data_dir, f'{m_type}_upper_rep{seed}.npy')
+
+            y_pred  = np.load(y_pred_file).reshape(-1, 1)
+            y_var   = np.load(y_var_file).reshape(-1, 1)
+            y_lower = np.load(y_lower_file).reshape(-1, 1)
+            y_upper = np.load(y_upper_file).reshape(-1, 1)
 
             metrics[name]["crps"] = crps_gaussian(y_pred, y_var, y_test)
             
@@ -137,8 +149,7 @@ def single_run(N1, N2, d, seed,
 # ============================================================================
 def run_replicates(d, N1, N2, n_replicates, base_seed,
                    data_dir,
-                   criterion='nlpd', 
-                   tuning_method='grid',
+                   criterion='nlml', 
                    model_names=None,
                    kernel='gaussian'): 
 
@@ -157,7 +168,6 @@ def run_replicates(d, N1, N2, n_replicates, base_seed,
             kernel,
             data_dir=data_dir,            
             criterion=criterion, 
-            tuning_method=tuning_method,   
             model_names=model_names
         )
 
@@ -176,8 +186,7 @@ def run_replicates(d, N1, N2, n_replicates, base_seed,
 def run_experiment(d, N1, N2,
                    n_replicates, base_seed,
                    data_dir, plot_dir,
-                   criterion='nlpd',
-                   tuning_method='grid',
+                   criterion='nlml',
                    model_names=None,
                    kernel='gaussian'):
 
@@ -185,7 +194,6 @@ def run_experiment(d, N1, N2,
         d, N1, N2, n_replicates, base_seed,
         data_dir, 
         criterion=criterion, 
-        tuning_method=tuning_method,
         model_names=model_names,
         kernel=kernel
     )
@@ -195,7 +203,6 @@ def run_experiment(d, N1, N2,
         errors["high"], N2, plot_dir,
         high_fidelity=True,
         criterion=criterion,
-        tuning_method=tuning_method,
         metric_name="RMSE", 
         file_prefix="rmse_boxplot",
         kernel=kernel)
@@ -205,7 +212,6 @@ def run_experiment(d, N1, N2,
         r2_scores, N2, plot_dir,
         high_fidelity=True,
         criterion=criterion,
-        tuning_method=tuning_method,
         metric_name="R2 Score", 
         file_prefix="r2_boxplot",
         kernel=kernel)
@@ -214,28 +220,26 @@ def run_experiment(d, N1, N2,
         crps, N2, plot_dir,
         high_fidelity=True,
         criterion=criterion,
-        tuning_method=tuning_method,
         metric_name="crps", 
         file_prefix="crps_boxplot",
         kernel=kernel)
 
+    
     # Coverage plot
     plot_boxplot(
         coverages, N2, plot_dir, 
         high_fidelity=True, 
         criterion=criterion, 
-        tuning_method=tuning_method, 
         metric_name="Coverage", 
         file_prefix="coverage_boxplot",
         target_value=0.95,
         kernel=kernel
     )
-
+    
     # Timing box plot
     plot_boxplot(
         timings, plot_dir=plot_dir,
         criterion=criterion,
-        tuning_method=tuning_method,
         metric_name="Time (s)",
         is_timing=True,
         N1=N1, N2=N2,

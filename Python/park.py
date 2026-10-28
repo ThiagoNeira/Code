@@ -5,13 +5,11 @@ if __name__ == "__main__":
     import os
 
     models_to_run = {
-            "MF_RFF_Bayes_l": {"type": "MF_RFF_Bayes_l", "n_restarts": 5, "n_samples": 250},
-            "MF_RFF_Bayes_nl": {"type": "MF_RFF_Bayes_nl", "n_restarts": 5, "n_samples": 250},
-            "GP": {"n_restarts": 5},
-            "KO": {"n_restarts": 5},
-            "NARGP": {"n_restarts": 5},
+            "MF_RFF_Bayes_l": {"type": "MF_RFF_Bayes_l", "n_restarts": 10, "n_samples": 250},
+            "MF_RFF_Bayes_nl": {"type": "MF_RFF_Bayes_nl", "n_restarts": 10, "n_samples": 250},
             "rna": {},
-            "cokm": {}   
+            "cokm": {},
+            "NARGP": {"n_restarts": 5}
             }
  
     # ── Park ─────────────────────────────────────────────────────────────────
@@ -23,7 +21,6 @@ if __name__ == "__main__":
         data_dir="Data/park",
         plot_dir="plots/park",
         criterion='nlml',
-        tuning_method='optim',
         model_names=models_to_run,
         kernel='gaussian'
     )       
