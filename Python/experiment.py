@@ -1,5 +1,6 @@
 # experiment.py
 import os
+import re
 import inspect
 import numpy as np
 from sklearn.metrics import r2_score, mean_squared_error
@@ -34,6 +35,62 @@ def _build_bayes(name, params, d, seed, kernel, is_linear):
                   n_restarts=5, linear=is_linear)
     kwargs.update({k: v for k, v in params.items() if k not in _RESERVED_KEYS})
     return MF_RFF_bayes(**kwargs)
+
+# ============================================================================
+# Data loading: stacked R output, with fallback to legacy per-replicate files
+# ============================================================================
+# Stacked layout (written by the R scripts, one file per quantity):
+#   X{l}.npy, y{l}.npy        rows of all replicates; column 0 = replicate index
+#   {rna,cokm}_{mean,sigma2,lower,upper}.npy   (n_rep, n_test); row i-1 = replicate i
+#   {rna,cokm}_time.npy       (n_rep,); entry i-1 = replicate i
+# Legacy layout: X{l}_{N}_rep{i}.npy, y{l}_{N}_rep{i}.npy, {rna,cokm}_{field}_rep{i}.npy
+_PRECOMPUTED_FIELDS = ("mean", "sigma2", "lower", "upper", "time")
+_stacked_cache = {}  # path -> (mtime, array)
+
+
+def _load_stacked(path):
+    """Loads a stacked file once (reloaded if it changes on disk). Returns None if absent."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    cached = _stacked_cache.get(path)
+    if cached is None or cached[0] != mtime:
+        cached = (mtime, np.load(path))
+        _stacked_cache[path] = cached
+    return cached[1]
+
+
+def _load_level(base_data_dir, prefix, lvl, N, seed, legacy=False):
+    """Training inputs (prefix 'X', shape (n, d)) or outputs (prefix 'y', shape (n, 1))
+    of 1-based level `lvl` for replicate `seed`."""
+    path = os.path.join(base_data_dir, f'{prefix}{lvl}.npy')
+    stacked = None if legacy else _load_stacked(path)
+    if stacked is None:
+        arr = np.load(os.path.join(base_data_dir, f'{prefix}{lvl}_{N}_rep{seed}.npy'))
+    else:
+        arr = stacked[stacked[:, 0] == seed, 1:]
+        if arr.shape[0] == 0:
+            raise ValueError(f"Replicate {seed} not found in {path}")
+    return arr if prefix == 'X' else arr.reshape(-1, 1)
+
+
+def _load_precomputed(base_data_dir, m_type, field, seed, legacy=False):
+    """Precomputed R baseline result ('rna' / 'cokm') for replicate `seed`:
+    a float for field 'time', otherwise an (n_test, 1) array."""
+    path = os.path.join(base_data_dir, f'{m_type}_{field}.npy')
+    stacked = None if legacy else _load_stacked(path)
+    if stacked is None:
+        arr = np.load(os.path.join(base_data_dir, f'{m_type}_{field}_rep{seed}.npy'))
+    else:
+        if not 1 <= seed <= stacked.shape[0]:
+            raise ValueError(f"Replicate {seed} not found in {path} ({stacked.shape[0]} replicates)")
+        arr = stacked[seed - 1]
+        if np.all(np.isnan(arr)):
+            raise ValueError(f"Replicate {seed} in {path} was not computed (R run incomplete?)")
+    if field == 'time':
+        return float(np.ravel(arr)[0])
+    return np.asarray(arr).reshape(-1, 1)
 
 # ============================================================================
 # Single run (Generalized for L levels)
@@ -72,8 +129,8 @@ def single_run(N_list, d, seed,
     y_list = []
     for lvl, N in enumerate(N_list):
         # 1-based indexing for filenames (X1, X2, etc.)
-        X_list.append(np.load(os.path.join(base_data_dir, f'X{lvl+1}_{N}_rep{seed}.npy')))
-        y_list.append(np.load(os.path.join(base_data_dir, f'y{lvl+1}_{N}_rep{seed}.npy')).reshape(-1, 1))
+        X_list.append(_load_level(base_data_dir, 'X', lvl + 1, N, seed))
+        y_list.append(_load_level(base_data_dir, 'y', lvl + 1, N, seed))
 
     X_test = np.load(os.path.join(base_data_dir, 'x_test.npy'))
     y_test = np.load(os.path.join(base_data_dir, 'yhigh_test.npy'))
@@ -108,9 +165,9 @@ def single_run(N_list, d, seed,
         model_types[name] = model_type
 
         if model_type == "KO":
-            models[name] = KO(n_restarts=params.get("n_restarts", 5), kernel=kernel)
+            models[name] = KO(n_restarts=params.get("n_restarts", 5), kernel=kernel, seed=seed)
         elif model_type == "NARGP":
-            models[name] = NARGP(n_restarts=params.get("n_restarts", 5), kernel=kernel)
+            models[name] = NARGP(n_restarts=params.get("n_restarts", 5), nsamples=params.get("nsamples", 1000), kernel=kernel, seed=seed)
         elif model_type == "GP":
             models[name] = GP(n_restarts=params.get("n_restarts", 5), kernel=kernel)
         elif "MF_RFF_Bayes" in model_type:
@@ -130,15 +187,14 @@ def single_run(N_list, d, seed,
         m_type = model_types[name]
         
         if m_type in ["rna", "cokm"]:
-            time_file = os.path.join(base_data_dir, f'{m_type}_time_rep{seed}.npy')
-            time_elapsed = float(np.load(time_file))
+            time_elapsed = _load_precomputed(base_data_dir, m_type, 'time', seed)
             print(f"[TIMER] {name} ({m_type}): {time_elapsed:.3f}s")
             timing[name] = time_elapsed
 
-            y_pred  = np.load(os.path.join(base_data_dir, f'{m_type}_mean_rep{seed}.npy')).reshape(-1, 1)
-            y_var   = np.load(os.path.join(base_data_dir, f'{m_type}_sigma2_rep{seed}.npy')).reshape(-1, 1)
-            y_lower = np.load(os.path.join(base_data_dir, f'{m_type}_lower_rep{seed}.npy')).reshape(-1, 1)
-            y_upper = np.load(os.path.join(base_data_dir, f'{m_type}_upper_rep{seed}.npy')).reshape(-1, 1)
+            y_pred  = _load_precomputed(base_data_dir, m_type, 'mean', seed)
+            y_var   = _load_precomputed(base_data_dir, m_type, 'sigma2', seed)
+            y_lower = _load_precomputed(base_data_dir, m_type, 'lower', seed)
+            y_upper = _load_precomputed(base_data_dir, m_type, 'upper', seed)
 
             metrics[name]["crps"] = crps_gaussian(y_pred, y_var, y_test)
             
@@ -270,3 +326,123 @@ def run_experiment(d, N_list,
         n_replicates=n_replicates,
         kernel=kernel
     )
+
+# ============================================================================
+# One-off conversion: legacy per-replicate folders -> stacked layout
+# ============================================================================
+def pack_legacy_folder(folder, delete_legacy=False):
+    """
+    Converts one data folder (e.g. Data/branin/20_15_10) from the legacy per-replicate
+    files to the stacked layout read by `single_run`, without re-running R.
+
+    The folder name gives N_list; only files matching it are packed (others are reported
+    as leftovers). After writing, every replicate is loaded through both layouts and
+    compared with np.array_equal (values, shape, dtype). If anything differs, the new
+    files are removed and an error is raised. Legacy files are deleted only when
+    `delete_legacy=True` and the check passed.
+    """
+    folder = os.path.normpath(folder)
+    N_list = [int(n) for n in os.path.basename(folder).split("_")]
+    files = set(os.listdir(folder))
+
+    def seeds_for(pattern):
+        rx = re.compile(pattern)
+        return sorted(int(m.group(1)) for f in files for m in [rx.fullmatch(f)] if m)
+
+    # --- Build the stacked arrays -------------------------------------------
+    out = {}
+    used = set()
+    seeds = seeds_for(rf"X1_{N_list[0]}_rep(\d+)\.npy")
+    for lvl, N in enumerate(N_list, start=1):
+        for prefix in ("X", "y"):
+            blocks = []
+            for s in seeds:
+                fname = f"{prefix}{lvl}_{N}_rep{s}.npy"
+                arr = np.load(os.path.join(folder, fname))
+                arr = arr.reshape(arr.shape[0], -1)
+                blocks.append(np.column_stack([np.full(arr.shape[0], float(s)), arr]))
+                used.add(fname)
+            out[f"{prefix}{lvl}.npy"] = np.vstack(blocks)
+
+    pred_seeds = {}
+    for m_type in ("rna", "cokm"):
+        s_list = seeds_for(rf"{m_type}_mean_rep(\d+)\.npy")
+        if not s_list:
+            continue
+        pred_seeds[m_type] = s_list
+        n_rep = max(s_list)
+        for field in _PRECOMPUTED_FIELDS:
+            stacked = None
+            for s in s_list:
+                fname = f"{m_type}_{field}_rep{s}.npy"
+                arr = np.ravel(np.load(os.path.join(folder, fname)))
+                if stacked is None:
+                    stacked = np.full((n_rep,) if field == "time" else (n_rep, arr.size), np.nan)
+                stacked[s - 1] = arr[0] if field == "time" else arr
+                used.add(fname)
+            out[f"{m_type}_{field}.npy"] = stacked
+
+    clash = [f for f in out if f in files]
+    if clash:
+        raise FileExistsError(f"{folder}: stacked files already exist: {clash}")
+    for fname, arr in out.items():
+        np.save(os.path.join(folder, fname), arr)
+
+    # --- Verify: stacked loader == legacy loader, bit for bit ---------------
+    def same(a, b):
+        return (np.array_equal(a, b) and a.shape == b.shape and a.dtype == b.dtype) \
+            if isinstance(a, np.ndarray) else a == b
+
+    try:
+        for s in seeds:
+            for lvl, N in enumerate(N_list, start=1):
+                for prefix in ("X", "y"):
+                    if not same(_load_level(folder, prefix, lvl, N, s),
+                                _load_level(folder, prefix, lvl, N, s, legacy=True)):
+                        raise ValueError(f"mismatch: {prefix}{lvl} replicate {s}")
+        for m_type, s_list in pred_seeds.items():
+            for s in s_list:
+                for field in _PRECOMPUTED_FIELDS:
+                    if not same(_load_precomputed(folder, m_type, field, s),
+                                _load_precomputed(folder, m_type, field, s, legacy=True)):
+                        raise ValueError(f"mismatch: {m_type}_{field} replicate {s}")
+    except Exception:
+        for fname in out:
+            os.remove(os.path.join(folder, fname))
+        raise
+
+    leftovers = sorted(f for f in files if re.search(r"_rep\d+\.npy$", f) and f not in used)
+    if delete_legacy:
+        for fname in used:
+            os.remove(os.path.join(folder, fname))
+
+    summary = {"folder": folder, "replicates": len(seeds),
+               "precomputed": {k: len(v) for k, v in pred_seeds.items()},
+               "files_written": sorted(out), "legacy_files_verified": len(used),
+               "legacy_deleted": delete_legacy, "unpacked_leftovers": leftovers}
+    print(f"[PACK] {folder}: {len(seeds)} replicates, {len(used)} legacy files -> "
+          f"{len(out)} stacked files, verified identical"
+          + (", legacy deleted" if delete_legacy else "")
+          + (f"; {len(leftovers)} leftover per-rep files not matching N_list" if leftovers else ""))
+    return summary
+
+
+def pack_all_legacy(data_root=None, delete_legacy=False):
+    """Runs `pack_legacy_folder` on every Data/<fn>/<N1>_..._<NL>/ folder that still
+    has legacy files and no stacked files yet."""
+    if data_root is None:
+        data_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Data')
+    summaries = []
+    for fn in sorted(os.listdir(data_root)):
+        fn_dir = os.path.join(data_root, fn)
+        if not os.path.isdir(fn_dir):
+            continue
+        for design in sorted(os.listdir(fn_dir)):
+            folder = os.path.join(fn_dir, design)
+            if not (os.path.isdir(folder) and re.fullmatch(r"\d+(_\d+)+", design)):
+                continue
+            if os.path.exists(os.path.join(folder, "X1.npy")):
+                print(f"[PACK] {folder}: already stacked, skipped")
+                continue
+            summaries.append(pack_legacy_folder(folder, delete_legacy=delete_legacy))
+    return summaries

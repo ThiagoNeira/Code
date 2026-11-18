@@ -1,4 +1,11 @@
 # rff_linear_algebra.py
+"""
+Bayesian linear algebra routines for Random Fourier Feature regression.
+Automatically switches between:
+  - Primal Augmented Householder QR (p <= N): O(N p^2 + p^3), square-root conditioning.
+  - Dual Cholesky with Woodbury & Matheron's Rule (p > N): O(N^2 p + N^3).
+Includes mode='r' fast value-only NLML evaluation and exact analytical NLML gradients.
+"""
 import numpy as np
 import scipy.linalg as sla
 from scipy.special import gammaln
@@ -7,39 +14,65 @@ LN10 = np.log(10.0)
 
 
 def _prior_diag(Sigma):
-    """Diagonal of the prior precision matrix (dense diagonal matrix or vector accepted)."""
+    """
+    Extracts and validates the 1D diagonal of the prior precision matrix Sigma.
+    Accepts either a 1D vector of length p or a 2D diagonal matrix of shape (p, p).
+    """
     S = np.asarray(Sigma, dtype=float)
-    d = np.diag(S).copy() if S.ndim == 2 else S.ravel().copy()
-    if not np.all(np.isfinite(d)) or np.any(d <= 0):
-        raise np.linalg.LinAlgError("Prior precision Sigma must be positive definite.")
+    d = np.diag(S) if S.ndim == 2 else S.ravel()
+    if not np.all(np.isfinite(d)) or np.any(d <= 0.0):
+        raise np.linalg.LinAlgError("Prior precision Sigma must be finite and positive definite.")
     return d
 
 
 def _augmented_qr(psi, y, mu, prec):
-    """Primal solver: O(N p^2 + p^3). Best when p <= N."""
+    """
+    Primal solver via thin Householder QR on the augmented system:
+        A = [psi; diag(sqrt(prec))],   b_aug = [y; sqrt(prec) * mu]
+    Operates at square-root condition number sqrt(kappa(K)). Best when p <= N.
+    """
     sqrt_prec = np.sqrt(prec)
     A = np.vstack([psi, np.diag(sqrt_prec)])
     b_aug = np.vstack([y, sqrt_prec[:, None] * mu])
 
     Q_qr, R = np.linalg.qr(A, mode='reduced')
     signs = np.sign(np.diag(R))
-    signs[signs == 0] = 1.0
-    R = signs[:, None] * R
-    Q_qr = Q_qr * signs[None, :]
+    signs[signs == 0.0] = 1.0
+    R *= signs[:, None]
+    Q_qr *= signs[None, :]
 
     gamma = sla.solve_triangular(R, Q_qr.T @ b_aug, lower=False, check_finite=False)
     Q = float(np.sum((b_aug - A @ gamma) ** 2))
     return Q_qr, R, gamma, Q
 
 
+def _augmented_qr_value_only(psi, y, mu, prec):
+    """
+    Fast value-only primal solver using QR with mode='r' on the (N + p) x (p + 1)
+    extended matrix [A | b_aug].
+      - R_ext[:p, :p] is the upper Cholesky factor R of K = A.T @ A.
+      - R_ext[p, p]^2 is the exact residual sum of squares Q = min_gamma ||b_aug - A @ gamma||_2^2.
+    Skips Q_qr construction and triangular solves during LHS screening.
+    """
+    p = psi.shape[1]
+    sqrt_prec = np.sqrt(prec)
+    A = np.vstack([psi, np.diag(sqrt_prec)])
+    b_aug = np.vstack([y, sqrt_prec[:, None] * mu])
+    R_ext = np.linalg.qr(np.hstack([A, b_aug]), mode='r')
+    diag_R = np.abs(np.diag(R_ext[:p, :p]))
+    Q = float(R_ext[p, p] ** 2)
+    return diag_R, Q
+
+
 def _dual_cholesky(psi, y, mu, prec):
     """
-    Dual solver: O(N^2 p + N^3). Best when p > N.
-    Forms M = I_N + psi @ diag(1/prec) @ psi.T = L_M @ L_M.T (N x N).
+    Dual solver via the N x N covariance matrix:
+        M = I_N + psi @ diag(1 / prec) @ psi.T = L_M @ L_M.T
+    Best when p > N.
     """
     N = psi.shape[0]
     inv_prec = 1.0 / prec
-    psi_scaled = psi * inv_prec[None, :]          # (N, p) = Psi @ Sigma^{-1}
+    psi_scaled = psi * inv_prec[None, :]          # (N, p) = psi @ Sigma^{-1}
     M = psi_scaled @ psi.T                        # (N, N)
     M[np.diag_indices(N)] += 1.0
 
@@ -54,7 +87,10 @@ def _dual_cholesky(psi, y, mu, prec):
 
 
 def _nlml_value_from_logdet(N, a, b, Q, half_log_det_ratio):
-    """NLML given 0.5 * (log|K| - log|Sigma|) = sum(log(diag(L_primal))) - 0.5*sum(log(prec)) = sum(log(diag(L_M)))."""
+    """
+    Evaluates the Negative Log Marginal Likelihood (NLML) of the conjugate
+    Normal-Inverse-Gamma (NIG) model given 0.5 * (log|K| - log|Sigma|).
+    """
     a_N = a + N / 2.0
     b_N = b + 0.5 * Q
     nlml = ((gammaln(a) - a * np.log(b))
@@ -66,24 +102,82 @@ def _nlml_value_from_logdet(N, a, b, Q, half_log_det_ratio):
 
 def parameter_bayes(psi, y, mu, Sigma):
     """
-    Posterior mean gamma, Q = ||y - psi g||^2 + (g-mu)' Sigma (g-mu), and lower factor L with L L' = K.
-    Currently restricted to the primal solver because MF_RFF_Bayes expects a (p x p) Cholesky factor for MC sampling.
+    Computes exact conjugate Bayesian posterior parameters for design matrix `psi`.
     """
-    y = np.asarray(y, dtype=float).reshape(-1, 1)
-    mu = np.asarray(mu, dtype=float).reshape(-1, 1)
-    _, R, gamma, Q = _augmented_qr(psi, y, mu, _prior_diag(Sigma))
-    return gamma, Q, R.T
-
-
-def score_bayes(psi, y, mu, Sigma, a, b):
     y = np.asarray(y, dtype=float).reshape(-1, 1)
     mu = np.asarray(mu, dtype=float).reshape(-1, 1)
     N, p = psi.shape
     prec = _prior_diag(Sigma)
 
     if p <= N:
-        _, R, _, Q = _augmented_qr(psi, y, mu, prec)
-        half_log_det = float(np.sum(np.log(np.diag(R)))) - 0.5 * float(np.sum(np.log(prec)))
+        _, R, gamma, Q = _augmented_qr(psi, y, mu, prec)
+        return gamma, Q, R.T
+    L_M, _, gamma, Q, _ = _dual_cholesky(psi, y, mu, prec)
+    return gamma, Q, L_M
+
+
+def sample_weights_bayes(gamma_hat, L, sigma_samples, psi_train, Sigma, rng):
+    """
+    Draws S posterior weight vectors from N(gamma_hat, sigma_s^2 * K^{-1}), returning shape (S, p).
+    - When `psi_train` is None (Primal, p <= N): direct triangular solve with L (p, p).
+    - When `psi_train` is provided (Dual, p > N): Matheron's rule with L_M (N, N).
+    """
+    gamma_hat = np.asarray(gamma_hat, dtype=float).reshape(-1, 1)
+    p = gamma_hat.shape[0]
+    sigma_samples = np.atleast_1d(sigma_samples).astype(float)
+    S = sigma_samples.shape[0]
+    sqrt_sig = np.sqrt(sigma_samples)[None, :]                        # (1, S)
+
+    if psi_train is None:
+        zz = rng.standard_normal((p, S))
+        dev = sla.solve_triangular(L, zz, lower=True, trans='T', check_finite=False)
+        return (gamma_hat + sqrt_sig * dev).T                         # (S, p)
+
+    N = psi_train.shape[0]
+    prec = _prior_diag(Sigma)
+    inv_prec = 1.0 / prec                                             # (p,)
+    inv_sqrt_prec = np.sqrt(inv_prec)                                 # (p,)
+
+    gamma_0 = inv_sqrt_prec[:, None] * rng.standard_normal((p, S))    # (p, S)
+    eps_0 = rng.standard_normal((N, S))                               # (N, S)
+
+    v = sla.solve_triangular(L, psi_train @ gamma_0 + eps_0, lower=True, check_finite=False)
+    u = sla.solve_triangular(L, v, lower=True, trans='T', check_finite=False)
+
+    dev = gamma_0 - inv_prec[:, None] * (psi_train.T @ u)             # (p, S)
+    return (gamma_hat + sqrt_sig * dev).T                             # (S, p)
+
+
+def leverage_bayes(psi_star, L, psi_train, Sigma):
+    """
+    Computes the quadratic leverage form h(x_*) = diag(psi_star @ K^{-1} @ psi_star.T)
+    as a 1D array of length N_test.
+    """
+    if psi_train is None:
+        v_mat = sla.solve_triangular(L, psi_star.T, lower=True, check_finite=False)
+        return np.sum(v_mat ** 2, axis=0)
+
+    prec = _prior_diag(Sigma)
+    psi_star_scaled = psi_star / prec[None, :]                        # (N_test, p)
+    h_prior = np.sum(psi_star_scaled * psi_star, axis=1)              # (N_test,)
+    cross = psi_train @ psi_star_scaled.T                             # (N, N_test)
+    v_mat = sla.solve_triangular(L, cross, lower=True, check_finite=False)
+    return np.maximum(0.0, h_prior - np.sum(v_mat ** 2, axis=0))
+
+
+def score_bayes(psi, y, mu, Sigma, a, b):
+    """
+    Evaluates the Negative Log Marginal Likelihood (NLML) without gradients.
+    Uses mode='r' augmented QR when p <= N to skip Q_qr construction and triangular solves.
+    """
+    y = np.asarray(y, dtype=float).reshape(-1, 1)
+    mu = np.asarray(mu, dtype=float).reshape(-1, 1)
+    N, p = psi.shape
+    prec = _prior_diag(Sigma)
+
+    if p <= N:
+        diag_R, Q = _augmented_qr_value_only(psi, y, mu, prec)
+        half_log_det = float(np.sum(np.log(diag_R))) - 0.5 * float(np.sum(np.log(prec)))
     else:
         L_M, _, _, Q, _ = _dual_cholesky(psi, y, mu, prec)
         half_log_det = float(np.sum(np.log(np.diag(L_M))))
@@ -93,6 +187,10 @@ def score_bayes(psi, y, mu, Sigma, a, b):
 
 
 def score_bayes_with_grad(psi, y, mu, Sigma, a, b, X_eff, omega, tune_nugget=False):
+    """
+    Evaluates the NLML and its exact analytical gradient with respect to
+    log10(eta) (and log10(lam) if tune_nugget=True).
+    """
     y = np.asarray(y, dtype=float).reshape(-1, 1)
     mu = np.asarray(mu, dtype=float).reshape(-1, 1)
     N, p = psi.shape
@@ -118,17 +216,15 @@ def score_bayes_with_grad(psi, y, mu, Sigma, a, b, X_eff, omega, tune_nugget=Fal
         half_log_det = float(np.sum(np.log(np.diag(L_M))))
         nlml, a_N, b_N = _nlml_value_from_logdet(N, a, b, Q_raw, half_log_det)
 
-        # M^{-1} via N x N triangular inverse
         L_M_inv = sla.solve_triangular(L_M, np.eye(N), lower=True, check_finite=False)
-        M_inv = L_M_inv.T @ L_M_inv                                       # (N, N)
+        M_inv = L_M_inv.T @ L_M_inv
         scale_Q = a_N / b_N
 
-        # Psi_Kinv[:, :2m] = (1 / lam) * M_inv @ psi[:, :2m], and r = alpha
         G = (1.0 / lam) * (M_inv @ psi[:, :two_m]) - (scale_Q * alpha) @ gamma[:two_m].T
 
         if tune_nugget:
-            # (1/lam) * psi[:, :2m] @ psi[:, :2m].T is M - I_N (minus the rho rank-1 piece if p > 2m)
-            Gram_2m = (M - np.eye(N)) if p == two_m else (psi[:, :two_m] @ psi[:, :two_m].T) / lam
+            Phi2m = psi[:, :two_m]
+            Gram_2m = (Phi2m @ Phi2m.T) / lam
             lam_tr_Kinv = float(two_m - np.sum(M_inv * Gram_2m))
 
     Phi_cos, Phi_sin = psi[:, :m], psi[:, m:two_m]
