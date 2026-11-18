@@ -9,6 +9,7 @@ Supports an arbitrary number of fidelity levels L >= 1:
         Solved across all S trajectories simultaneously via exact Schur-complement rank-1 updates.
       * Non-linear (NARGP-style) link : f_l(x) = phi_l([x, tilde{f}_{l-1}(x)]) @ w_l
         Accelerated via precomputed spatial projections X @ omega_x.T.
+        Non-linear levels use the product kernel k_x(x, x') * k_f(f, f').
 
 At prediction time, computes and saves the predictive mean, total predictive variance,
 consistent 3-way variance decomposition (var_prop/varexp, var_weights, var_noise, expvar),
@@ -632,12 +633,20 @@ class MF_RFF_bayes:
 
         self.base_freq = []
         for lvl in range(self.L):
-            d_lvl = self.d if (lvl == 0 or self.linear[lvl]) else (self.d + 1)
-            self.base_freq.append(
-                base_frequencies(
-                    self.m[lvl], d_lvl, kernel=self.kernel, seed=self.seeds_freq[lvl], method=self.freq_method
+            if lvl == 0 or self.linear[lvl]:
+                self.base_freq.append(
+                    base_frequencies(
+                        self.m[lvl], self.d, kernel=self.kernel, seed=self.seeds_freq[lvl], method=self.freq_method
+                    )
                 )
-            )
+            else:
+                # Product kernel k_x * k_f: independent spectral draws for the x-block and the f-block.
+                self.base_freq.append(
+                    base_frequencies(
+                        self.m[lvl], self.d + 1, kernel=self.kernel, seed=self.seeds_freq[lvl],
+                        method=self.freq_method, blocks=(self.d, 1)
+                    )
+                )
 
         self.y_mean = [float(yl.mean()) for yl in y_clean]
         yc_list = [y_clean[lvl] - self.y_mean[lvl] for lvl in range(self.L)]

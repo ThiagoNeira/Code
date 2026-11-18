@@ -29,10 +29,15 @@ def _orthogonal_gaussian(m, d, rng):
     return np.vstack(blocks)[:m]
 
 
-def base_frequencies(m, d, kernel='gaussian', seed=None, method='sobol'):
+def base_frequencies(m, d, kernel='gaussian', seed=None, method='sobol', blocks=None):
     """
     Draws m unit-scale spectral frequency vectors in R^d according to Bochner's theorem.
     method: 'mc' (i.i.d.), 'sobol' (scrambled QMC), or 'orthogonal' (ORF).
+    blocks: optional tuple of positive ints summing to d (e.g. (d_x, 1)) that partitions the
+      columns into independent blocks, giving the product of per-block kernels (one Gamma
+      variable per block per row for Matern). None means a single block, i.e. the plain
+      d-dimensional kernel. It has no effect for the Gaussian kernel, whose coordinates are
+      already independent.
     """
     rng = seed if isinstance(seed, np.random.Generator) else np.random.default_rng(seed)
     kernel = kernel.lower()
@@ -40,6 +45,33 @@ def base_frequencies(m, d, kernel='gaussian', seed=None, method='sobol'):
         raise ValueError(f"Unknown kernel '{kernel}'. Choose 'gaussian', 'matern32', or 'matern52'.")
     nu = _MATERN_NU.get(kernel)
     method = method.lower()
+
+    if blocks is not None:
+        blocks = tuple(blocks)
+        if (len(blocks) == 0
+                or not all(isinstance(b, (int, np.integer)) and not isinstance(b, bool) and b > 0 for b in blocks)
+                or sum(blocks) != d):
+            raise ValueError(f"blocks must be a tuple of positive ints summing to d={d}, got {blocks}.")
+
+    if nu is not None and blocks is not None and len(blocks) > 1:
+        n_blocks = len(blocks)
+        if method == 'mc':
+            Z = rng.standard_normal((m, d))
+            g = rng.gamma(shape=nu, scale=1.0, size=(m, n_blocks))
+        elif method == 'sobol':
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                U = qmc.Sobol(d=d + n_blocks, scramble=True, seed=rng).random(m)
+            U = np.clip(U, 1e-12, 1.0 - 1e-12)
+            Z = norm.ppf(U[:, :d])
+            g = gamma_dist.ppf(U[:, d:d + n_blocks], a=nu)
+        elif method in ('orthogonal', 'orf'):
+            Z = _orthogonal_gaussian(m, d, rng)
+            g = rng.gamma(shape=nu, scale=1.0, size=(m, n_blocks))
+        else:
+            raise ValueError(f"Unknown method '{method}'. Choose 'mc', 'sobol', or 'orthogonal'.")
+        block_of_col = np.repeat(np.arange(n_blocks), blocks)
+        return np.sqrt(nu / g)[:, block_of_col] * Z
 
     if method == 'mc':
         Z = rng.standard_normal((m, d))
@@ -71,9 +103,11 @@ def scale_frequencies(base, eta):
     return base * np.sqrt(2.0 * eta)[None, :]
 
 
-def sample_frequencies(m, d, kernel='gaussian', eta=1.0, seed=None, method='sobol'):
+def sample_frequencies(m, d, kernel='gaussian', eta=1.0, seed=None, method='sobol', blocks=None):
     """Convenience wrapper that draws base frequencies and scales them by `eta`."""
-    return scale_frequencies(base_frequencies(m, d, kernel=kernel, seed=seed, method=method), eta)
+    return scale_frequencies(
+        base_frequencies(m, d, kernel=kernel, seed=seed, method=method, blocks=blocks), eta
+    )
 
 
 def phi_from_proj(projection):
