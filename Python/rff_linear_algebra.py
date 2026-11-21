@@ -165,6 +165,27 @@ def leverage_bayes(psi_star, L, psi_train, Sigma):
     return np.maximum(0.0, h_prior - np.sum(v_mat ** 2, axis=0))
 
 
+def dual_leverage_factor(L, psi_train, Sigma):
+    """
+    Precomputes the test-independent dual leverage factor (Dual, p > N only):
+        V = L_M^{-1} @ psi_train @ diag(1 / prec),   shape (N, p),
+    so that h(x_*) = h_prior(x_*) - ||V @ psi_star.T||^2 column-wise (see `leverage_from_factor`).
+    """
+    prec = _prior_diag(Sigma)
+    return sla.solve_triangular(L, psi_train / prec[None, :], lower=True, check_finite=False)
+
+
+def leverage_from_factor(psi_star, V, h_prior):
+    """
+    Dual leverage h(x_*) = h_prior - rowsum((psi_star @ V.T)^2) from a precomputed factor
+    V = dual_leverage_factor(...). Equals `leverage_bayes` in dual mode, with a single GEMM
+    and no triangular solve. `h_prior` is diag(psi_star @ diag(1/prec) @ psi_star.T)
+    (scalar or (N_test,) array).
+    """
+    G = psi_star @ V.T                                                # (N_test, N)
+    return np.maximum(0.0, h_prior - np.einsum('ij,ij->i', G, G))
+
+
 def score_bayes(psi, y, mu, Sigma, a, b):
     """
     Evaluates the Negative Log Marginal Likelihood (NLML) without gradients.

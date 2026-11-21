@@ -28,6 +28,8 @@ from rff_linear_algebra import (
     parameter_bayes,
     sample_weights_bayes,
     leverage_bayes,
+    dual_leverage_factor,
+    leverage_from_factor,
     score_bayes,
     score_bayes_with_grad,
 )
@@ -268,7 +270,7 @@ class MF_RFF_bayes:
         """
         f_std = (f_prev - self.f_loc[lvl]) / self.f_scale[lvl]
         omega_f = self.omega[lvl][:, self.d:]                 # (m_l, 1)
-        return phi_from_proj(proj_x + f_std @ omega_f.T)
+        return phi_from_proj(proj_x + f_std * omega_f.T)      # rank-1 outer product via broadcasting
 
     def _eval_nlml(self, design, y, X_eff, omega, mu, Sigma, grad):
         """Evaluates NLML (and exact gradient if grad=True) for a single level."""
@@ -457,6 +459,8 @@ class MF_RFF_bayes:
         Worker for a single trajectory `s` of a non-linear level `lvl >= 1`:
         builds Psi_s from precomputed `proj_x_l`, solves the NIG posterior, caches
         `psi_s` if in dual mode (p > N), and draws the coupled pair (sig2_s, w_l^{(s)}).
+        Also returns the prediction caches: GW_s = [gamma_hat_s, w_s] (p, 2) for a single
+        merged GEMM, and the dual leverage factor V_s = L_s^{-1} psi_s / prec (None if primal).
         """
         rng_s = np.random.default_rng(child_seed)
         psi_s = self._nl_design_from_proj(lvl, proj_x_l, f_prev_s)
@@ -468,7 +472,10 @@ class MF_RFF_bayes:
         w_s = sample_weights_bayes(
             gamma_hat_s, L_s, np.array([sig2_s]), psi_cache_s, self.Sigma_inv[lvl], rng_s
         ).ravel()
-        return gamma_hat_s, Q_s, L_s, psi_cache_s, w_s, sig2_s
+        GW_s = np.hstack([gamma_hat_s, w_s[:, None]])                          # (p, 2)
+        V_s = (dual_leverage_factor(L_s, psi_s, self.Sigma_inv[lvl])
+               if psi_cache_s is not None else None)                           # (N, p) or None
+        return gamma_hat_s, Q_s, L_s, psi_cache_s, w_s, sig2_s, GW_s, V_s
 
     def _fit_posteriors(self, X_list, yc_list):
         """
@@ -520,7 +527,7 @@ class MF_RFF_bayes:
                         for s in range(S)
                     )
 
-                gamma_list, Q_list, L_list, psi_cache_list, w_list, sig2_list = zip(*results)
+                gamma_list, Q_list, L_list, psi_cache_list, w_list, sig2_list, GW_list, V_list = zip(*results)
                 Q_vec = np.asarray(Q_list, dtype=float)
                 sig2_lvl = np.asarray(sig2_list, dtype=float)
                 W_lvl = np.vstack(w_list)                                # (S, p_l)
@@ -529,6 +536,8 @@ class MF_RFF_bayes:
                     'gamma_hat': list(gamma_list),
                     'L_chol': list(L_list),
                     'psi_train': list(psi_cache_list),
+                    'GW': list(GW_list),                                 # (p_l, 2) per trajectory
+                    'V': list(V_list),                                   # (N_l, p_l) per trajectory (dual) or None
                 }
 
             self.W.append(W_lvl)
@@ -669,6 +678,8 @@ class MF_RFF_bayes:
           - `'varexp'`      : Alias for `'var_prop'` (consistent across all levels).
           - `'expvar'`      : `'var_weights' + 'var_noise'` (consistent across all levels).
           - `'var'`         : Total predictive variance `'varexp' + 'expvar'`.
+          - `'var_epistemic'`: Variance of the latent f_l(x), `'var_prop' + 'var_weights'`
+                               (total variance minus the observation noise `'var_noise'`).
         """
         if self.L is None:
             raise RuntimeError("Call fit(X_list, y_list) before predict().")
@@ -716,6 +727,7 @@ class MF_RFF_bayes:
             'var_prop': var_prop0,
             'var_weights': var_weights0,
             'var_noise': var_noise0,
+            'var_epistemic': var_prop0 + var_weights0,
             'q_lo': q_lo0,
             'q_hi': q_hi0,
         }
@@ -743,23 +755,35 @@ class MF_RFF_bayes:
                 W_lvl = self.W[lvl]
                 Z_curr = phi_l_star @ W_lvl[:, :self.p[lvl]].T + Z_prev * W_lvl[:, self.p[lvl]][None, :]
             else:
-                # Fast direct loop with precomputed spatial projection X @ omega_x.T
+                # Threaded per-trajectory loop with precomputed spatial projection X @ omega_x.T.
+                # Each worker writes its own column; trig and BLAS release the GIL.
                 proj_x_star = X @ self.omega[lvl][:, :self.d].T            # (N_test, m_l)
                 mu_s = np.empty((N_test, S), dtype=float)
                 H_mat = np.empty((N_test, S), dtype=float)
                 Z_curr = np.empty((N_test, S), dtype=float)
 
-                gamma_list = cache['gamma_hat']
+                GW_list = cache['GW']
+                V_list = cache['V']
                 L_list = cache['L_chol']
-                psi_train_list = cache['psi_train']
                 Sigma_inv_l = self.Sigma_inv[lvl]
-                W_lvl = self.W[lvl]
+                # Every RFF row has unit norm ((1/m) sum(cos^2 + sin^2) = 1) and non-linear
+                # levels have constant prior precision lam, so h_prior = 1/lam exactly.
+                h_prior_l = 1.0 / self.lam[lvl]
 
-                for s in range(S):
+                def _predict_traj(s):
                     psi_star_s = self._nl_design_from_proj(lvl, proj_x_star, Z_prev[:, [s]])
-                    mu_s[:, s] = (psi_star_s @ gamma_list[s]).ravel()
-                    H_mat[:, s] = leverage_bayes(psi_star_s, L_list[s], psi_train_list[s], Sigma_inv_l)
-                    Z_curr[:, s] = psi_star_s @ W_lvl[s]
+                    out_s = psi_star_s @ GW_list[s]                        # (N_test, 2): [mu_s, Z_s]
+                    mu_s[:, s] = out_s[:, 0]
+                    Z_curr[:, s] = out_s[:, 1]
+                    if V_list[s] is not None:
+                        H_mat[:, s] = leverage_from_factor(psi_star_s, V_list[s], h_prior_l)
+                    else:
+                        H_mat[:, s] = leverage_bayes(psi_star_s, L_list[s], None, Sigma_inv_l)
+
+                with threadpool_limits(limits=1, user_api='blas'):
+                    Parallel(n_jobs=-1, backend="threading")(
+                        delayed(_predict_traj)(s) for s in range(S)
+                    )
 
             # Consistent 3-way & 2-way Law of Total Variance decomposition
             noise_s = Q_vec / (alpha_l - 2.0)                              # (S,)
@@ -790,6 +814,7 @@ class MF_RFF_bayes:
                 'var_prop': var_prop_l,
                 'var_weights': var_weights_l,
                 'var_noise': var_noise_l,
+                'var_epistemic': var_prop_l + var_weights_l,
                 'q_lo': q_lo_l,
                 'q_hi': q_hi_l,
             }
