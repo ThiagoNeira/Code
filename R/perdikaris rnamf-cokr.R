@@ -22,7 +22,7 @@ f2 <- function(x)
 }
 
 ### training data ###
-n1 <- 50; n2 <- 14; n.rep <- 100
+n1 <- 13; n2 <- 8; n.rep <- 100
 d <- 1
 
 # Create dynamic folder name based on n1 and n2
@@ -110,11 +110,18 @@ for(i in 1:n.rep) {
   
   ### Cokriging ###
   tic.cokm <- proc.time()[3]
-  NestDesign <- NestedDesignBuild(design = list(X1, X2))
+  # NestedX already returns a nested design with X2 = last nrow(X2) rows of X1, so build the
+  # NestDesign directly. Re-running the substitution via NestedDesignBuild can break in 1-D
+  # (e.g. seed 5 gives a 52-row level-1 design for 51 responses -> "invalid class km object").
+  NestDesign <- NestedDesign(X1, nlevel = 2,
+                             indices = list(seq(nrow(X1) - nrow(X2) + 1, nrow(X1))))
+  # A tiny fixed nugget is required: without it the gauss correlation matrix of the 1-D
+  # level-2 design is numerically singular ("leading minor ... not positive") on every seed.
   fit.muficokm <- MuFicokm(formula = list(~1,~1),
                            MuFidesign = NestDesign,
                            covtype="gauss",
-                           lower=1e-4, 
+                           nugget=1e-8,
+                           lower=1e-4,
                            response = list(y1,y2),
                            nlevel = 2)
   pred.muficokm <- predict(fit.muficokm, x, "UK")

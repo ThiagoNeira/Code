@@ -1,6 +1,7 @@
 rm(list = ls())
 
 install.packages("C:/Users/Santiago/OneDrive/Escritorio/Research/Orthogonal Project/Code/R/RNAmf_0.1.2.tar.gz", repos = NULL, type = "source")
+library(RNAmf)
 library(DiceKriging)
 library(MuFiCokriging)
 library(RcppCNPy)
