@@ -65,7 +65,7 @@ What needs what:
 - R ≥ 4.x; R 4.6.2 is installed on one of the machines.
 - CRAN packages: `install.packages(c("DiceKriging", "RcppCNPy", "glue", "lhs", "plgp", "foreach", "doParallel"))`. `plgp`, `foreach` and `doParallel` are RNAmf's own imports.
 - `MuFiCokriging` (for co-kriging) may have to be installed from the CRAN archive if `install.packages` can't find it.
-- RNAmf 0.1.2 comes from the local tarball: `install.packages("<path>/Code/R/RNAmf_0.1.2.tar.gz", repos = NULL, type = "source")`. Every data-generating R script runs this line itself, but with a hard-coded path (§7).
+- RNAmf 0.1.2 comes from the local tarball: `install.packages("<path>/Code/R/RNAmf_0.1.2.tar.gz", repos = NULL, type = "source")`. Every data-generating R script runs this line itself, with the path found automatically (§7).
 
 ### Running
 
@@ -627,7 +627,7 @@ Test functions, low → high fidelity. These are the R definitions; `harness/tes
 ## 7. R side: data and R baselines
 
 - **Never edit the R scripts or their outputs unless the user explicitly asks.** Python only reads them.
-- **Hard-coded paths.** The data-generating R scripts (`<fn> rnamf-cokr.R`, `perdikaris rnamf.R`, `ALM <fn>.R`) install `C:/Users/Santiago/.../R/RNAmf_0.1.2.tar.gz` and write to `data_root <- "C:/Users/Santiago/.../Python/Data"`. That is another machine's user folder; this machine is `C:/Users/santh/...`.
+- **No hard-coded paths.** The data-generating R scripts (`<fn> rnamf-cokr.R`, `perdikaris rnamf.R`, `ALM <fn>.R`) start with an `r_dir <- local({...})` block that finds their own folder, `Code/R/`. It works with `Rscript` (decoding its `~+~` encoding of spaces), `source()` and RStudio; in a plain console it falls back to the working directory, and stops with a clear message unless that folder contains `RNAmf_0.1.2.tar.gz`. They install `file.path(r_dir, "RNAmf_0.1.2.tar.gz")` and write to `data_root <- file.path(dirname(r_dir), "Python", "Data")`, so they run unchanged on any machine. Keep that block in new data-generating scripts.
 - **`../R/<fn> rnamf-cokr.R`** (branin, borehole, currin, park, perdikaris):
   - Runs 100 replicates of `NestedX` designs, with RNAmf (`kernel="sqex"`, `constant=TRUE`) and co-kriging fits.
   - Writes to `Data/<fn>/<N1>_..._<NL>/` in the stacked layout, with a checkpoint every 10 replicates.
