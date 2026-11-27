@@ -1,6 +1,19 @@
 rm(list = ls())
 
-install.packages("C:/Users/Santiago/OneDrive/Escritorio/Research/Orthogonal Project/Code/R/RNAmf_0.1.2.tar.gz", repos = NULL, type = "source")
+# Locate this script's folder (Code/R/) so that no path depends on the machine or the working
+# directory. Works with Rscript, source() and RStudio; otherwise the working directory must be Code/R/.
+r_dir <- local({
+  f <- sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value = TRUE))
+  f <- gsub("~+~", " ", f, fixed = TRUE)   # Rscript encodes spaces in the file name as ~+~
+  if (length(f) == 0) f <- tryCatch(sys.frame(1)$ofile, error = function(e) NULL)
+  if (length(f) == 0 && requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable())
+    f <- rstudioapi::getSourceEditorContext()$path
+  d <- if (length(f) == 1 && nzchar(f)) dirname(normalizePath(f)) else getwd()
+  if (!file.exists(file.path(d, "RNAmf_0.1.2.tar.gz")))
+    stop("Cannot locate Code/R/. Run this script with Rscript or source(), or setwd() to Code/R/ first.")
+  normalizePath(d, winslash = "/")
+})
+install.packages(file.path(r_dir, "RNAmf_0.1.2.tar.gz"), repos = NULL, type = "source")
 library(RNAmf)
 library(DiceKriging)
 library(MuFiCokriging)
@@ -22,12 +35,12 @@ f2 <- function(x)
 }
 
 ### training data ###
-n1 <- 50; n2 <- 14; n.rep <- 100
+n1 <- 13; n2 <- 8; n.rep <- 100
 d <- 1
 
 # Create dynamic folder name based on n1 and n2
 # Results are written straight into the Python data folder (no manual copying needed)
-data_root <- "C:/Users/Santiago/OneDrive/Escritorio/Research/Orthogonal Project/Code/Python/Data"
+data_root <- file.path(dirname(r_dir), "Python", "Data")   # Code/Python/Data
 dir_name <- file.path(data_root, glue("perdikaris/{n1}_{n2}"))
 
 # Create the directory if it doesn't already exist
@@ -110,11 +123,18 @@ for(i in 1:n.rep) {
   
   ### Cokriging ###
   tic.cokm <- proc.time()[3]
-  NestDesign <- NestedDesignBuild(design = list(X1, X2))
+  # NestedX already returns a nested design with X2 = last nrow(X2) rows of X1, so build the
+  # NestDesign directly. Re-running the substitution via NestedDesignBuild can break in 1-D
+  # (e.g. seed 5 gives a 52-row level-1 design for 51 responses -> "invalid class km object").
+  NestDesign <- NestedDesign(X1, nlevel = 2,
+                             indices = list(seq(nrow(X1) - nrow(X2) + 1, nrow(X1))))
+  # A tiny fixed nugget is required: without it the gauss correlation matrix of the 1-D
+  # level-2 design is numerically singular ("leading minor ... not positive") on every seed.
   fit.muficokm <- MuFicokm(formula = list(~1,~1),
                            MuFidesign = NestDesign,
                            covtype="gauss",
-                           lower=1e-4, 
+                           nugget=1e-8,
+                           lower=1e-4,
                            response = list(y1,y2),
                            nlevel = 2)
   pred.muficokm <- predict(fit.muficokm, x, "UK")
