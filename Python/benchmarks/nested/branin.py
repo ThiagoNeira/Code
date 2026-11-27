@@ -1,7 +1,8 @@
 # branin.py (adapted from perdikaris.py)
-import os
 import numpy as np
-from experiment import run_experiment
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))  # Python/, so a plain `python <file>` also works
+from harness.experiment import run_experiment
 
 # ----------------------------------------------------------------------------
 # MF_RFF_bayes parameters for the 3-level Branin function. 
@@ -46,7 +47,6 @@ models_to_run = {
 }
 
 if __name__ == "__main__":
-    os.makedirs("plots/branin", exist_ok=True)
 
     run_experiment(
         d=2,                                # Branin function dimensionality

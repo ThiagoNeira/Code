@@ -1,7 +1,7 @@
-# perdikaris.py
-import os
 import numpy as np
-from experiment import run_experiment
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))  # Python/, so a plain `python <file>` also works
+from harness.experiment import run_experiment
 
 # ----------------------------------------------------------------------------
 # MF_RFF_bayes parameters. Every key below is forwarded to MF_RFF_bayes(...), and every one can be
@@ -26,40 +26,38 @@ BAYES_COMMON = dict(
 )
 
 # Independent search boxes per level (log10 units). None -> class defaults.
-#   eta_bounds    : list of L (lo, hi) pairs for spatial bandwidths
-#   eta_bounds_f  : list of L-1 (lo, hi) pairs for the f_{l-1} coordinate (non-linear model only)
-#   nugget_bounds : list of L (lo, hi) pairs per level (None -> nugget_bounds)
+#   eta_bounds1 / eta_bounds2 : (lo, hi) for all x-dims, or a list of d (lo, hi) pairs
+#   eta_bounds_f1             : (lo, hi) for the f1 coordinate (non-linear model only)
+#   nugget_bounds1 / 2        : (lo, hi) per level (None -> nugget_bounds)
 models_to_run = {
 
-    
     "MF_RFF_Bayes_l": {
         "type": "MF_RFF_Bayes_l",
         **BAYES_COMMON,
-        "eta_bounds": [(2, 3.7), (2, 3.7)],
-        "nugget_bounds": [(-8, -3), (-8, -3)],
+        "eta_bounds": [(-3, 1),(-3, 1)], 
+        "nugget_bounds": [(-8, -3),(-8, -3)], 
     },
 
     "MF_RFF_Bayes_nl": {
         "type": "MF_RFF_Bayes_nl",
         **BAYES_COMMON,
-        "eta_bounds": [(0.5, 2.5), (-3, 0.5)],
-        "eta_bounds_f": [(-3, 0.5)],
-        "nugget_bounds": [(-8, -3), (-8, -3)],
+        "eta_bounds": [(-3, 0), (-4, 0)],
+        "eta_bounds_f": [(-5, -1)],
+        "nugget_bounds": [(-8, -3),(-8, -3)], 
     },
 
     "rna": {},
 }
 
 if __name__ == "__main__":
-    os.makedirs("plots/perdikaris", exist_ok=True)
 
+    # ── Park ─────────────────────────────────────────────────────────────────
     run_experiment(
-        d=1,
-        N_list=[13, 8],
-        n_replicates=100, 
-        base_seed=0,
-        data_dir="Data/perdikaris",
-        plot_dir="plots/perdikaris",
+        d=4,
+        N_list=[40, 20],
+        n_replicates=100, base_seed=0,
+        data_dir="Data/park",
+        plot_dir="plots/park",
         model_names=models_to_run,
         kernel='gaussian'
     )

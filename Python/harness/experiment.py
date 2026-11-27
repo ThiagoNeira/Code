@@ -5,12 +5,13 @@ import inspect
 import numpy as np
 from sklearn.metrics import r2_score, mean_squared_error
 
-from utils import timer, crps_ensemble, crps_gaussian
-from MF_RFF_Bayes import MF_RFF_bayes
-from NARGP import NARGP
-from KO_model import KO
-from One_shot_GP import GP
-from plotting import plot_boxplot
+from harness.utils import timer, crps_ensemble, crps_gaussian
+from model.MF_RFF_Bayes import MF_RFF_bayes
+from baselines.NARGP import NARGP
+from baselines.KO_model import KO
+from baselines.One_shot_GP import GP
+from harness.plotting import plot_boxplot
+from paths import DATA
 
 # ============================================================================
 # MF_RFF_bayes configuration
@@ -18,7 +19,7 @@ from plotting import plot_boxplot
 # Dynamically read constructor arguments so it naturally supports generalized L-level args
 # like `nuggets`, `feature_mults`, `eta_bounds`, etc.
 _BAYES_PARAMS = {p for p in inspect.signature(MF_RFF_bayes.__init__).parameters if p not in ("self", "d")}
-_RESERVED_KEYS = {"type"}  # keys used by this file, not forwarded to the model
+_RESERVED_KEYS = {"type", "standardize"}  # keys used by this file, not forwarded to the model
 
 def _build_bayes(name, params, d, seed, kernel, is_linear):
     """
@@ -35,6 +36,39 @@ def _build_bayes(name, params, d, seed, kernel, is_linear):
                   n_restarts=5, linear=is_linear)
     kwargs.update({k: v for k, v in params.items() if k not in _RESERVED_KEYS})
     return MF_RFF_bayes(**kwargs)
+
+
+class _Standardized:
+    """
+    Wraps a GPy baseline (KO, NARGP, GP): fits it on y standardized by one mean and one sd pooled
+    over all levels, and maps predictions back (mean * s + m, var * s^2). One common transform keeps
+    the relation between levels intact. Used through {"standardize": True} in a model config: the
+    baselines' kernel-variance and noise bounds assume roughly unit-scale, zero-mean outputs.
+    """
+
+    def __init__(self, model):
+        self.model = model
+
+    def fit(self, X, y):
+        multi = isinstance(y, (list, tuple))
+        pooled = np.concatenate([np.ravel(v) for v in y]) if multi else np.ravel(y)
+        self.loc = float(pooled.mean())
+        self.scale = float(pooled.std()) if pooled.std() > 0 else 1.0
+        z = ([(np.asarray(v, dtype=float) - self.loc) / self.scale for v in y] if multi
+             else (np.asarray(y, dtype=float) - self.loc) / self.scale)
+        self.model.fit(X, z)
+        return self
+
+    def predict(self, X, return_ci=False, return_var=False):
+        mean, var = self.model.predict(X, return_var=True)
+        mean = mean * self.scale + self.loc
+        var = var * self.scale ** 2
+        if return_ci:
+            std = np.sqrt(var)
+            return mean, var, mean - 1.96 * std, mean + 1.96 * std
+        if return_var:
+            return mean, var
+        return mean
 
 # ============================================================================
 # Data loading: stacked R output, with fallback to legacy per-replicate files
@@ -117,12 +151,11 @@ def single_run(N_list, d, seed,
     model_names : dict or list, optional
         Dictionary mapping model aliases to their hyperparameter configurations.
     """
-    script_dir = os.path.dirname(os.path.abspath(__file__))
     clean_data_dir = data_dir.replace("Data/", "").replace("Data\\", "")
     
     # Data folder is formatted as N0_N1_..._NL (e.g., "100_50_10")
     folder_name = "_".join(str(n) for n in N_list)
-    base_data_dir = os.path.join(script_dir, 'Data', clean_data_dir, folder_name)
+    base_data_dir = os.path.join(DATA, clean_data_dir, folder_name)
 
     # 1. Load L-Level Data dynamically
     X_list = []
@@ -133,7 +166,11 @@ def single_run(N_list, d, seed,
         y_list.append(_load_level(base_data_dir, 'y', lvl + 1, N, seed))
 
     X_test = np.load(os.path.join(base_data_dir, 'x_test.npy'))
-    y_test = np.load(os.path.join(base_data_dir, 'yhigh_test.npy'))
+    y_test = np.ravel(np.load(os.path.join(base_data_dir, 'yhigh_test.npy')))
+    # Noisy data (noisy_data.py): RMSE and R2 against the noise-free outputs, CRPS and coverage
+    # against noisy test observations, since every model's predictive includes the noise.
+    noisy_path = os.path.join(base_data_dir, 'yhigh_test_noisy.npy')
+    y_obs = np.ravel(np.load(noisy_path)) if os.path.exists(noisy_path) else y_test
 
     # 2. Setup Models via Dictionary Configuration
     if model_names is None:
@@ -177,6 +214,11 @@ def single_run(N_list, d, seed,
         elif model_type in ["rna", "cokm"]:
             models[name] = "precomputed"
 
+        if params.get("standardize", False):
+            if model_type not in ("KO", "NARGP", "GP"):
+                raise ValueError(f"Model '{name}': 'standardize' applies to KO, NARGP and GP only.")
+            models[name] = _Standardized(models[name])
+
     # 3. Fit and Evaluate 
     timing = {}
     metrics = {}
@@ -196,15 +238,15 @@ def single_run(N_list, d, seed,
             y_lower = _load_precomputed(base_data_dir, m_type, 'lower', seed)
             y_upper = _load_precomputed(base_data_dir, m_type, 'upper', seed)
 
-            metrics[name]["crps"] = crps_gaussian(y_pred, y_var, y_test)
-            
+            metrics[name]["crps"] = crps_gaussian(y_pred, y_var, y_obs)
+
         else:
             with timer(name, timing):
                 if m_type == "GP":
                     # Single fidelity baselines only train on the highest fidelity data
                     model.fit(X_list[-1], y_list[-1])
                     y_pred, y_var, y_lower, y_upper = model.predict(X_test, return_ci=True)
-                    metrics[name]["crps"] = crps_gaussian(y_pred, y_var, y_test)
+                    metrics[name]["crps"] = crps_gaussian(y_pred, y_var, y_obs)
                 
                 else:
                     # Generalized L-level training for all MF models
@@ -214,13 +256,13 @@ def single_run(N_list, d, seed,
                         # Extract predictions specifically for the target fidelity (level = -1)
                         # MF_RFF_bayes internally caches all L levels' statistics in `self.last_predictions_`
                         y_pred, _, y_lower, y_upper, y_samples = model.predict(X_test, level=-1, return_samples=True)
-                        metrics[name]["crps"] = crps_ensemble(y_samples, y_test)
+                        metrics[name]["crps"] = crps_ensemble(y_samples, y_obs)
                     else:
                         # Fallback for standard MF baselines (KO, NARGP)
                         y_pred, y_var, y_lower, y_upper = model.predict(X_test, return_ci=True)
-                        metrics[name]["crps"] = crps_gaussian(y_pred, y_var, y_test)
+                        metrics[name]["crps"] = crps_gaussian(y_pred, y_var, y_obs)
 
-        coverages[name] = ((y_test >= y_lower.ravel()) & (y_test <= y_upper.ravel())).mean()
+        coverages[name] = ((y_obs >= y_lower.ravel()) & (y_obs <= y_upper.ravel())).mean()
         metrics[name]["rmse_high"] = np.sqrt(mean_squared_error(y_test, y_pred))
         metrics[name]["r2"] = r2_score(y_test, y_pred)
         
@@ -431,7 +473,7 @@ def pack_all_legacy(data_root=None, delete_legacy=False):
     """Runs `pack_legacy_folder` on every Data/<fn>/<N1>_..._<NL>/ folder that still
     has legacy files and no stacked files yet."""
     if data_root is None:
-        data_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Data')
+        data_root = DATA
     summaries = []
     for fn in sorted(os.listdir(data_root)):
         fn_dir = os.path.join(data_root, fn)

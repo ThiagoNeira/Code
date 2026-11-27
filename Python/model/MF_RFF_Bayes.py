@@ -23,13 +23,15 @@ from scipy.optimize import minimize
 from joblib import Parallel, delayed
 from threadpoolctl import threadpool_limits
 
-from features_full import base_frequencies, scale_frequencies, phi, phi_from_proj
-from rff_linear_algebra import (
+from model.features_full import base_frequencies, scale_frequencies, phi, phi_from_proj, phi_vjp
+from model.rff_linear_algebra import (
     parameter_bayes,
     sample_weights_bayes,
     leverage_bayes,
     dual_leverage_factor,
     leverage_from_factor,
+    kinv_psi,
+    kinv_psi_from_factor,
     score_bayes,
     score_bayes_with_grad,
 )
@@ -839,3 +841,160 @@ class MF_RFF_bayes:
         if return_samples:
             return res['mean'], res['var'], res['q_lo'], res['q_hi'], res['samples']
         return res['mean'], res['var'], res['q_lo'], res['q_hi']
+
+    # ------------------------------------------------------------------ epistemic variance gradient
+    def epistemic_var_grad(self, X, level=-1):
+        """
+        Epistemic variance Var[f_level(x)] = var_prop + var_weights (predict's 'var_epistemic')
+        and its exact gradient with respect to x. Everything is fixed after fit (frequencies,
+        weight draws, factors), so the variance is a smooth function of x.
+
+        Chain rule, with J the Jacobian of a design row and c_s = Q_s / (alpha_l - 2):
+          - leverage:   grad h = 2 J^T K^{-1} psi                  (kinv_psi / kinv_psi_from_factor)
+          - level 0:    grad Var = 2 c_0 J^T K^{-1} phi_0,  grad Z_s = J^T w_s
+          - non-linear: u_s = omega_x x + omega_f (Z_{l-1,s} - loc) / scale, so the projection's
+                        Jacobian is omega_x + omega_f grad Z_{l-1,s}^T / scale;
+                        grad mu_s = J_s^T gamma_hat_s,  grad Z_s = J_s^T w_s,  grad h_s = 2 J_s^T K_s^{-1} psi_s
+          - linear:     grad mu_s = J^T Beta_hat_s + rho_hat_s grad Z_{l-1,s},  grad Z_s = J^T beta_s + rho_s grad Z_{l-1,s},
+                        grad H_s = grad h_0 + 2 diff_s (grad Z_{l-1,s} - J^T B_F,s) / a_s
+          - total:      grad var_prop = (2/S) sum_s (mu_s - mean mu) grad mu_s,  grad var_weights = (1/S) sum_s c_s grad H_s
+
+        Levels above `level` are not evaluated. The trajectory loop is serial: for a few query
+        points it is much cheaper than predict's threaded loop.
+
+        X     : (n, d) inputs.
+        level : target level (negative values count from the top).
+        Returns (var, grad) of shapes (n,) and (n, d).
+        """
+        X, target = self._check_query(X, level, "epistemic_var_grad")
+        S = self.samples
+
+        if target == 0:
+            om0 = self.omega[0]
+            phi0 = phi(X, om0)                                             # (n, p_0)
+            h0, R0 = kinv_psi(phi0, self.L0, self.phi0_train, self.Sigma_inv[0])
+            c0 = self.Q0 / (self.N[0] + 2.0 * self.a_prior - 2.0)
+            return c0 * h0, 2.0 * c0 * (phi_vjp(phi0, R0) @ om0)
+
+        Z, dZ = self._level0_draws_grad(X)
+        for lvl in range(1, target + 1):
+            need_var = lvl == target
+            Z_next, dZ_next, mu, dmu, H, dH = self._level_draws_grad(lvl, X, Z, dZ, need_var)
+            if need_var:
+                c = self.Q[lvl] / (self.N[lvl] + 2.0 * self.a_prior - 2.0)  # (S,)
+                var_prop = np.var(mu, axis=1)
+                var_weights = np.mean(H * c[None, :], axis=1)
+                dev = mu - np.mean(mu, axis=1, keepdims=True)
+                grad = (2.0 / S) * np.einsum('ns,nsd->nd', dev, dmu) + np.einsum('nsd,s->nd', dH, c) / S
+                return var_prop + var_weights, grad
+            Z, dZ = Z_next, dZ_next
+
+    def latent_draws_grad(self, X, level=-1):
+        """
+        The S coupled posterior draws of the latent f_k (centered, noise-free) and their gradients
+        with respect to x, for every level k = 0..level. Same chain rule as epistemic_var_grad;
+        levels above `level` are not evaluated.
+
+        Returns (Z_list, dZ_list): Z_list[k] of shape (n, S), dZ_list[k] of shape (n, S, d).
+        """
+        X, target = self._check_query(X, level, "latent_draws_grad")
+        Z, dZ = self._level0_draws_grad(X)
+        Z_list, dZ_list = [Z], [dZ]
+        for lvl in range(1, target + 1):
+            Z, dZ, *_ = self._level_draws_grad(lvl, X, Z, dZ, need_var=False)
+            Z_list.append(Z)
+            dZ_list.append(dZ)
+        return Z_list, dZ_list
+
+    def _check_query(self, X, level, caller):
+        """Validates query inputs and a level index; returns (X as (n, d), 0-based level)."""
+        if self.L is None:
+            raise RuntimeError(f"Call fit(X_list, y_list) before {caller}().")
+        X = np.asarray(X, dtype=float)
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
+        if X.shape[1] != self.d:
+            raise ValueError(f"X has {X.shape[1]} columns; expected d={self.d}.")
+        target = int(level) + (self.L if int(level) < 0 else 0)
+        if not (0 <= target < self.L):
+            raise ValueError(f"Requested level={level} out of bounds for L={self.L} levels.")
+        return X, target
+
+    def _level0_draws_grad(self, X):
+        """Level-0 draws Z (n, S) = phi_0(X) W_0^T and their gradients dZ (n, S, d)."""
+        om0 = self.omega[0]
+        phi0 = phi(X, om0)                                                 # (n, p_0)
+        Z = phi0 @ self.W[0].T
+        dZ = np.swapaxes(phi_vjp(phi0, self.W[0].T[None]), 1, 2) @ om0
+        return Z, dZ
+
+    def _level_draws_grad(self, lvl, X, Z, dZ, need_var):
+        """
+        Propagates the draws (Z, dZ) of level lvl - 1 through level lvl >= 1.
+        Returns (Z_next, dZ_next, mu, dmu, H, dH): the level-lvl draws and their gradients, plus,
+        if need_var, the per-trajectory conditional means mu_s and leverages H_s with their
+        gradients (shapes (n, S) and (n, S, d)); otherwise those four are None.
+        """
+        n, d, S = X.shape[0], self.d, self.samples
+        cache = self.level_cache[lvl]
+        om = self.omega[lvl]
+        mu = dmu = H = dH = None
+        if self.linear[lvl]:
+            p = self.p[lvl]
+            phi_l = phi(X, om)                                             # (n, p_l)
+            W_lvl = self.W[lvl]
+            beta, rho = W_lvl[:, :p].T, W_lvl[:, p]                        # (p, S), (S,)
+            Z_next = phi_l @ beta + Z * rho[None, :]
+            if not need_var:
+                dB = np.swapaxes(phi_vjp(phi_l, beta[None]), 1, 2) @ om    # (n, S, d)
+                return Z_next, dB + rho[None, :, None] * dZ, mu, dmu, H, dH
+
+            h_base, R = kinv_psi(phi_l, cache['L_base'], cache['phi_cache_base'], cache['prec_base'])
+            dh_base = 2.0 * (phi_vjp(phi_l, R) @ om)                       # (n, d)
+            rho_hat, a_vec = cache['rho_hat'], cache['a_vec']
+            # Contract [Beta_hat | B_F | beta] with the Jacobian in one pass.
+            R3 = np.hstack([cache['Beta_hat'], cache['B_F'], beta])        # (p, 3S)
+            G3 = np.swapaxes(phi_vjp(phi_l, R3[None]), 1, 2) @ om          # (n, 3S, d)
+            dBh, dBF, dB = G3[:, :S], G3[:, S:2 * S], G3[:, 2 * S:]
+
+            mu = phi_l @ cache['Beta_hat'] + Z * rho_hat[None, :]
+            dmu = dBh + rho_hat[None, :, None] * dZ
+            diff = Z - phi_l @ cache['B_F']                                # (n, S)
+            H = h_base[:, None] + (diff ** 2) / a_vec[None, :]
+            dH = dh_base[:, None, :] + 2.0 * (diff / a_vec[None, :])[:, :, None] * (dZ - dBF)
+            dZ_next = dB + rho[None, :, None] * dZ
+            return Z_next, dZ_next, mu, dmu, H, dH
+
+        proj_x = X @ om[:, :d].T                                           # (n, m_l)
+        scale = self.f_scale[lvl]
+        Sigma_inv_l = self.Sigma_inv[lvl]
+        h_prior_l = 1.0 / self.lam[lvl]                                    # as in predict (unit-norm rows)
+        GW_list, V_list, L_list = cache['GW'], cache['V'], cache['L_chol']
+        p = self.p[lvl]
+        k = 3 if need_var else 2
+        Rk = np.empty((n, p, k))                                           # [gamma_hat_s, w_s(, K_s^{-1} psi_s)]
+
+        Z_next, dZ_next = np.empty((n, S)), np.empty((n, S, d))
+        if need_var:
+            mu, H = np.empty((n, S)), np.empty((n, S))
+            dmu, dH = np.empty((n, S, d)), np.empty((n, S, d))
+        for s in range(S):
+            psi = self._nl_design_from_proj(lvl, proj_x, Z[:, [s]])       # (n, p)
+            out = psi @ GW_list[s]                                         # (n, 2): [mu_s, Z_s]
+            Z_next[:, s] = out[:, 1]
+            Rk[:, :, :2] = GW_list[s]
+            if need_var:
+                mu[:, s] = out[:, 0]
+                if V_list[s] is not None:
+                    H[:, s], Rk[:, :, 2] = kinv_psi_from_factor(psi, V_list[s], Sigma_inv_l, h_prior_l)
+                else:
+                    H[:, s], Rk[:, :, 2] = kinv_psi(psi, L_list[s], None, Sigma_inv_l)
+
+            # d/dx through u_s = omega_x x + omega_f f_std: with g = dphi/du contracted,
+            # g @ omega = [g @ omega_x | g @ omega_f], and grad = g @ omega_x + (g @ omega_f) grad f_std.
+            gw = np.swapaxes(phi_vjp(psi, Rk), 1, 2) @ om                  # (n, k, d + 1)
+            g = gw[:, :, :d] + gw[:, :, d:] * (dZ[:, s, None, :] / scale)  # (n, k, d)
+            dZ_next[:, s] = g[:, 1]
+            if need_var:
+                dmu[:, s], dH[:, s] = g[:, 0], 2.0 * g[:, 2]
+        return Z_next, dZ_next, mu, dmu, H, dH

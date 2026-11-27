@@ -3,6 +3,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+from paths import under_root
 
 
 def plot_boxplot(
@@ -53,10 +54,8 @@ def plot_boxplot(
         suffix = "high" 
         filename = f"{file_prefix}_{suffix}_kernel={kernel}{samples_str}_N={N}_rep={n_rep}_criterion={criterion}.png"
 
-    # Ensure plot_dir is relative to this script's location if it's not absolute
-    if not os.path.isabs(plot_dir):
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        plot_dir = os.path.join(script_dir, plot_dir)
+    # A relative plot_dir (e.g. "plots/park") is taken from the Python/ folder, not the CWD
+    plot_dir = under_root(plot_dir)
 
     # Create the directory if it doesn't exist yet
     os.makedirs(plot_dir, exist_ok=True)

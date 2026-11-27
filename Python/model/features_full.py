@@ -125,6 +125,23 @@ def phi_from_proj(projection):
     return out
 
 
+def phi_vjp(features, R):
+    """
+    Vector-Jacobian contraction of the RFF map phi(u) = sqrt(1/m) [cos u, sin u] with respect
+    to the projection u = X @ omega.T, computed from the features themselves (no trig):
+        G[n, j] = d/du_nj (phi(u_n) . R_n) = sqrt(1/m) (cos u_nj R_n[m + j] - sin u_nj R_n[j]).
+    features : (N, 2m) output of `phi_from_proj` / `phi` ([cos | sin] column layout).
+    R        : (N, 2m) -> G is (N, m); or (N or 1, 2m, k) to contract k vectors at once
+               -> G is (N, m, k).
+    The gradient with respect to x follows from the chain rule, e.g. G @ omega when u = X @ omega.T.
+    """
+    m = features.shape[1] // 2
+    fc, fs = features[:, :m], features[:, m:]
+    if R.ndim == 2:
+        return fc * R[:, m:] - fs * R[:, :m]
+    return fc[:, :, None] * R[:, m:, :] - fs[:, :, None] * R[:, :m, :]
+
+
 def phi(X, omega):
     """
     Evaluates the normalized Random Fourier Feature map:

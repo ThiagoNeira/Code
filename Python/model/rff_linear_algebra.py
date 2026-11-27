@@ -186,6 +186,44 @@ def leverage_from_factor(psi_star, V, h_prior):
     return np.maximum(0.0, h_prior - np.einsum('ij,ij->i', G, G))
 
 
+def kinv_psi(psi_star, L, psi_train, Sigma):
+    """
+    Leverage h(x_*) = diag(psi_star K^{-1} psi_star.T) together with R = psi_star K^{-1},
+    shape (N_test, p), so that grad h = 2 J^T R for the Jacobian J of psi_star.
+    Same primal/dual switch, same arithmetic and the same clip at 0 as `leverage_bayes`;
+    rows of R are zeroed where h is clipped, so the gradient matches the clipped value.
+    """
+    if psi_train is None:                                             # primal: K = L L^T
+        v_mat = sla.solve_triangular(L, psi_star.T, lower=True, check_finite=False)
+        R = sla.solve_triangular(L, v_mat, lower=True, trans='T', check_finite=False).T
+        return np.sum(v_mat ** 2, axis=0), R
+
+    prec = _prior_diag(Sigma)                                         # dual: M = L L^T (Woodbury)
+    psi_star_scaled = psi_star / prec[None, :]                        # (N_test, p)
+    h_prior = np.sum(psi_star_scaled * psi_star, axis=1)              # (N_test,)
+    cross = psi_train @ psi_star_scaled.T                             # (N, N_test)
+    v_mat = sla.solve_triangular(L, cross, lower=True, check_finite=False)
+    u_mat = sla.solve_triangular(L, v_mat, lower=True, trans='T', check_finite=False)
+    R = psi_star_scaled - (psi_train.T @ u_mat).T / prec[None, :]     # psi_* (P^-1 - P^-1 Psi^T M^-1 Psi P^-1)
+    h_raw = h_prior - np.sum(v_mat ** 2, axis=0)
+    R[h_raw < 0.0] = 0.0
+    return np.maximum(0.0, h_raw), R
+
+
+def kinv_psi_from_factor(psi_star, V, prec, h_prior):
+    """
+    Dual leverage and R = psi_star K^{-1} from the cached factor V = dual_leverage_factor(...):
+        K^{-1} = diag(1/prec) - V^T V,   h = h_prior - rowsum((psi_star V^T)^2).
+    `prec` is the prior precision (scalar or (p,)); `h_prior` is as in `leverage_from_factor`.
+    The leverage equals `leverage_from_factor` exactly; rows of R are zeroed where h is clipped.
+    """
+    G = psi_star @ V.T                                                # (N_test, N)
+    h_raw = h_prior - np.einsum('ij,ij->i', G, G)
+    R = psi_star / prec - G @ V                                       # (N_test, p)
+    R[h_raw < 0.0] = 0.0
+    return np.maximum(0.0, h_raw), R
+
+
 def score_bayes(psi, y, mu, Sigma, a, b):
     """
     Evaluates the Negative Log Marginal Likelihood (NLML) without gradients.

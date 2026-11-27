@@ -1,5 +1,7 @@
 import numpy as np
-from experiment import run_experiment
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))  # Python/, so a plain `python <file>` also works
+from harness.experiment import run_experiment
 
 # ----------------------------------------------------------------------------
 # MF_RFF_bayes parameters. Every key below is forwarded to MF_RFF_bayes(...), and every one can be
@@ -27,20 +29,21 @@ BAYES_COMMON = dict(
 #   eta_bounds1 / eta_bounds2 : (lo, hi) for all x-dims, or a list of d (lo, hi) pairs
 #   eta_bounds_f1             : (lo, hi) for the f1 coordinate (non-linear model only)
 #   nugget_bounds1 / 2        : (lo, hi) per level (None -> nugget_bounds)
+
 models_to_run = {
 
     "MF_RFF_Bayes_l": {
         "type": "MF_RFF_Bayes_l",
         **BAYES_COMMON,
-        "eta_bounds": [(-3, 1),(-3, 1)], 
+        "eta_bounds": [(-4, 1.5),(-4, 1.5)], 
         "nugget_bounds": [(-8, -3),(-8, -3)], 
     },
 
     "MF_RFF_Bayes_nl": {
         "type": "MF_RFF_Bayes_nl",
         **BAYES_COMMON,
-        "eta_bounds": [(-3, 0), (-4, 0)],
-        "eta_bounds_f": [(-5, -1)],
+        "eta_bounds": [(-4, 1), (-4, 0)],
+        "eta_bounds_f": [(-4, -1)],
         "nugget_bounds": [(-8, -3),(-8, -3)], 
     },
 
@@ -48,16 +51,13 @@ models_to_run = {
 }
 
 if __name__ == "__main__":
-    import os
-
+ 
     # ── Park ─────────────────────────────────────────────────────────────────
-    os.makedirs("plots/park", exist_ok=True)
     run_experiment(
-        d=4,
-        N_list=[40, 20],
+        d=8,
+        N_list=[80, 40],
         n_replicates=100, base_seed=0,
-        data_dir="Data/park",
-        plot_dir="plots/park",
+        data_dir="Data/borehole",
+        plot_dir="plots/borehole",
         model_names=models_to_run,
-        kernel='gaussian'
-    )
+        kernel='gaussian')

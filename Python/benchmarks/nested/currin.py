@@ -1,9 +1,8 @@
 #Currin.py
 import numpy as np
-from experiment import run_experiment
-
-import numpy as np
-from experiment import run_experiment
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))  # Python/, so a plain `python <file>` also works
+from harness.experiment import run_experiment
 
 # ----------------------------------------------------------------------------
 # MF_RFF_bayes parameters. Every key below is forwarded to MF_RFF_bayes(...), and every one can be
@@ -52,10 +51,8 @@ models_to_run = {
 }
 
 if __name__ == "__main__":
-    import os
 
     # ── Currin ───────────────────────────────────────────────────────────────
-    os.makedirs("plots/currin", exist_ok=True)
     run_experiment(
         d=2,
          N_list=[20, 10],
